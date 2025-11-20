@@ -28,6 +28,7 @@ import sys
 from json import JSONDecodeError
 from time import sleep
 
+from tools.config import config
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
 from tools.server_utils import MCP_SERVER_URL, check_server_health
@@ -167,6 +168,7 @@ def main() -> None:
         logger.error("MCP server is not healthy. Exiting.")
         sys.exit(1)
 
+    logger.info(f"USER NAME={config.User.name}")
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Process some arguments.")
 
@@ -174,7 +176,9 @@ def main() -> None:
                         help='Session ID for the context memory')
     parser.add_argument('--question', type=str,
                         help='The question to ask the RAG server')
-    parser.add_argument('--model', type=str,
+    parser.add_argument('--model',
+                        type=str,
+                        default=config.LLM.name,
                         help='The model to use for generating the answer')
     args = parser.parse_args()
 

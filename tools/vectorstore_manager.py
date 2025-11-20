@@ -107,7 +107,9 @@ class VectorStoreManager:
     # ------------------------------------------------------------------
     def _initialize_vectorstore(self) -> Chroma:
         with self.lock:
-            existing_names = {c.name for c in self.client.list_collections()}
+            existing_names = set(self.client.list_collections())
+            # for older versions of chromadb, we may need to check existing collections manually
+            # existing_names = {c.name for c in self.client.list_collections()}
             if self.collection_name not in existing_names:
                 self.client.get_or_create_collection(self.collection_name)
                 logger.info(f"Created collection '{self.collection_name}'.")
