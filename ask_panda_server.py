@@ -63,7 +63,11 @@ from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional  # For type hinting
 
-from tools.tools import get_vectorstore_manager, Timer
+from tools.config import config
+from tools.tools import (
+    get_vectorstore_manager,
+    Timer
+)
 
 _MISTRAL_CONCURRENCY = asyncio.Semaphore(4)
 
@@ -487,6 +491,7 @@ async def rag_ask(request: QuestionRequest) -> dict[str, str]:
                         structured as `{"answer": "..."}`.
     """
     logger.info(f"Received query: '{request.question}' using model: '{request.model}'")
+    logger.info(f"Ask PanDA user: {config.User.name}")
 
     response_text = await mcp.rag_query(request.question, request.model.lower())
 
