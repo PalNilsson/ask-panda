@@ -33,14 +33,6 @@ from tools.https import download_data
 from tools.server_utils import MCP_SERVER_URL, check_server_health
 from tools.tools import reformat_errors
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler("maintenance.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("panda")

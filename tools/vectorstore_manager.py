@@ -38,13 +38,7 @@ from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings, OpenAIEmbeddings
 
-
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s"))
-    logger.addHandler(_h)
 
 
 class VectorStoreManager:
@@ -105,22 +99,24 @@ class VectorStoreManager:
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
-    def _initialize_vectorstore(self) -> Chroma:
-        with self.lock:
-            existing_names = set(self.client.list_collections())
-            # for older versions of chromadb, we may need to check existing collections manually
-            # existing_names = {c.name for c in self.client.list_collections()}
-            if self.collection_name not in existing_names:
-                self.client.get_or_create_collection(self.collection_name)
-                logger.info(f"Created collection '{self.collection_name}'.")
-            else:
-                logger.info(f"Loaded existing collection '{self.collection_name}'.")
+    def _initialize_vectorstore(self):
+        # Get existing collection names from Chroma client
+        existing_collections = self.client.list_collections()
+        existing_names = {c.name for c in existing_collections}
 
-            return Chroma(
-                client=self.client,
-                collection_name=self.collection_name,
-                embedding_function=self.embeddings,
-            )
+        if self.collection_name in existing_names:
+            logger.info(f"Using existing collection '{self.collection_name}'.")
+            collection = self.client.get_collection(self.collection_name)
+        else:
+            logger.info(f"Created collection '{self.collection_name}'.")
+            collection = self.client.create_collection(self.collection_name)
+
+        # Then wrap that collection in LangChain's Chroma vectorstore:
+        return Chroma(
+            client=self.client,
+            collection_name=self.collection_name,
+            embedding_function=self.embeddings,
+        )
 
     # ------------------------------------------------------------------
     # Loading and splitting

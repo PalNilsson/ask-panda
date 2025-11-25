@@ -41,14 +41,6 @@ from tools.errorcodes import EC_NOTFOUND, EC_OK, EC_UNKNOWN_ERROR, EC_TIMEOUT
 from tools.server_utils import MCP_SERVER_URL, check_server_health
 from tools.tools import fetch_data, read_json_file, read_file
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler("log_analysis.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 memory = ContextMemory()
 # mcp = FastMCP("panda")

@@ -37,14 +37,6 @@ from tools.errorcodes import EC_OK, EC_NOTFOUND, EC_UNKNOWN_ERROR
 from tools.https import download_data, get_base_url
 from tools.vectorstore_manager import VectorStoreManager
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler("tools.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 

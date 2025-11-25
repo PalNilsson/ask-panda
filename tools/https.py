@@ -45,14 +45,6 @@ from typing import IO
 
 from tools.errorcodes import EC_OK, EC_NOTFOUND, EC_UNKNOWN_ERROR
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler("tools-https.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 

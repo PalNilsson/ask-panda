@@ -33,15 +33,6 @@ from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
 from tools.server_utils import MCP_SERVER_URL, check_server_health
 
-# mcp = FastMCP("panda") # Removed unused instance
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler("document_query.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 memory = ContextMemory()
 

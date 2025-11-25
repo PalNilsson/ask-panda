@@ -41,14 +41,6 @@ from tools.https import get_base_url
 from tools.server_utils import MCP_SERVER_URL, check_server_health
 from tools.tools import fetch_data, read_json_file
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler("data_query.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 memory = ContextMemory()
 # mcp = FastMCP("panda")

@@ -29,14 +29,6 @@ from tools.errorcodes import EC_OK, EC_SERVERNOTRUNNING, EC_CONNECTIONPROBLEM, E
 # MCP server IP and env vars
 MCP_SERVER_URL: str = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s:%(message)s',
-    handlers=[
-        logging.FileHandler("server_utils.log"),
-        logging.StreamHandler()  # Optional: keeps logs visible in console too
-    ]
-)
 logger = logging.getLogger(__name__)
 
 

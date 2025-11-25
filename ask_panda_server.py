@@ -31,14 +31,22 @@ vector store for context retrieval, and defines a PandaMCP class to handle
 the RAG logic and interaction with the different LLMs.
 """
 
-# Set up basic logging configuration at the top of your file
+# Set up basic logging configuration at the top
 import logging
+from logging.handlers import RotatingFileHandler
+import sys
+from pathlib import Path
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "ask_panda.log"
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s:%(message)s',
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
     handlers=[
-        logging.FileHandler("ask_panda_server.log"),
-        logging.StreamHandler()  # Optional: keeps logs visible in console too
+        RotatingFileHandler(LOG_FILE, maxBytes=10_000_000, backupCount=5),
+        logging.StreamHandler(sys.stdout),
     ]
 )
 logger = logging.getLogger(__name__)
