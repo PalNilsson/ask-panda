@@ -43,6 +43,7 @@ import urllib.parse
 from urllib.parse import parse_qs
 from typing import IO
 
+from tools.config import config
 from tools.errorcodes import EC_OK, EC_NOTFOUND, EC_UNKNOWN_ERROR
 
 logger = logging.getLogger(__name__)
@@ -387,7 +388,7 @@ def get_base_url() -> str:
     # The base URL for the PanDA monitor
     default = os.environ.get("PANDA_BASE_URL")
 
-    return "https://bigpanda.cern.ch" if not default else default
+    return config.Urls.bigpanda if not default else default
 
 # Example
 # panda_type = "job"

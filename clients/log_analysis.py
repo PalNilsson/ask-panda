@@ -20,13 +20,17 @@
 
 """This client can download a log file from PanDA and ask an LLM to analyze the relevant parts."""
 
+from logging_config import setup_logging
+setup_logging("log_analysis")
+import logging
+logger = logging.getLogger(__name__)
+
 import argparse
 import ast
 # import asyncio
 import html
 import io
 import json
-import logging
 import os
 import re
 import requests
@@ -38,10 +42,9 @@ from time import sleep
 
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_NOTFOUND, EC_OK, EC_UNKNOWN_ERROR, EC_TIMEOUT
-from tools.server_utils import MCP_SERVER_URL, check_server_health
+from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
 from tools.tools import fetch_data, read_json_file, read_file
 
-logger = logging.getLogger(__name__)
 memory = ContextMemory()
 # mcp = FastMCP("panda")
 _CODEBLOCK_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+\-]*)\s*\n(?P<code>.*?)(?:```|$)", re.S)
@@ -293,7 +296,7 @@ class LogAnalysis:
             # Last resort: surface a concise error; caller can log `s` if needed
             raise SyntaxError("Could not parse structured payload")
 
-        server_url = f"{MCP_SERVER_URL}/rag_ask"
+        server_url = f"{ASK_PANDA_BASE_URL}/rag_ask"
         import time
         logger.info(f"ask() was called at {time.time()}")
 
@@ -1078,7 +1081,7 @@ def main():
     # Check server health before proceeding
     ec = check_server_health()
     if ec == EC_TIMEOUT:
-        logger.warning(f"Timeout while trying to connect to {MCP_SERVER_URL}.")
+        logger.warning(f"Timeout while trying to connect to {ASK_PANDA_BASE_URL}.")
         sleep(10)  # Wait for a while before retrying
         ec = check_server_health()
         if ec:

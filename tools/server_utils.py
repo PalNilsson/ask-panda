@@ -25,9 +25,19 @@ import os
 import requests
 
 from tools.errorcodes import EC_OK, EC_SERVERNOTRUNNING, EC_CONNECTIONPROBLEM, EC_TIMEOUT, EC_UNKNOWN_ERROR
+from tools.config import config
 
 # MCP server IP and env vars
-MCP_SERVER_URL: str = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
+_mcp_env = os.getenv("ASK_PANDA_BASE_URL")
+_mcp_cfg = None
+try:
+    _urls = getattr(config, "Urls", None)
+    if _urls is not None:
+        _mcp_cfg = getattr(_urls, "mcpserver", None)
+except Exception:
+    _mcp_cfg = None
+
+ASK_PANDA_BASE_URL: str = (_mcp_env.strip() if _mcp_env and _mcp_env.strip() else _mcp_cfg) or "http://localhost:8000"
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +55,7 @@ def check_server_health() -> int:
         Server error code (int): Exit code indicating the health status of the MCP server.
     """
     try:
-        response = requests.get(f"{MCP_SERVER_URL}/health", timeout=5)
+        response = requests.get(f"{ASK_PANDA_BASE_URL}/health", timeout=5)
         response.raise_for_status()
         if response.json().get("status") == "ok":
             logger.info("MCP server is running.")
@@ -53,10 +63,10 @@ def check_server_health() -> int:
         logger.warning("MCP server is not running.")
         return EC_SERVERNOTRUNNING
     except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout):
-        logger.warning(f"Timeout while trying to connect to MCP server at {MCP_SERVER_URL}.")
+        logger.warning(f"Timeout while trying to connect to MCP server at {ASK_PANDA_BASE_URL}.")
         return EC_TIMEOUT
     except requests.RequestException as e:
-        logger.warning(f"Cannot connect to MCP server at {MCP_SERVER_URL}: {e}")
+        logger.warning(f"Cannot connect to MCP server at {ASK_PANDA_BASE_URL}: {e}")
         return EC_CONNECTIONPROBLEM
     except Exception as e:
         logger.error(f"An unexpected error occurred while checking MCP server health: {e}")

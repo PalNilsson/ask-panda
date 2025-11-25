@@ -26,7 +26,14 @@ import re
 import configparser
 from typing import Any
 
-_default_cfg = os.path.join(os.path.dirname(__file__), 'default.cfg')
+# python
+from pathlib import Path
+
+# prefer `default.cfg` in the project root (one level up from `tools/`),
+# otherwise fall back to the `tools/` directory
+_proj_root_cfg = Path(__file__).resolve().parents[1] / 'default.cfg'
+_module_cfg = Path(__file__).resolve().parent / 'default.cfg'
+_default_cfg = str(_proj_root_cfg if _proj_root_cfg.exists() else _module_cfg)
 
 
 class _ConfigurationSection():

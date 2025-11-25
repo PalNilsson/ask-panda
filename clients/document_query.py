@@ -20,8 +20,12 @@
 
 """This script is a simple command-line client that interacts with a RAG (Retrieval-Augmented Generation) server."""
 
-import argparse
+from logging_config import setup_logging
+setup_logging("document_query")
 import logging
+logger = logging.getLogger(__name__)
+
+import argparse
 import os
 import requests
 import sys
@@ -31,9 +35,8 @@ from time import sleep
 from tools.config import config
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
-from tools.server_utils import MCP_SERVER_URL, check_server_health
+from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
 
-logger = logging.getLogger(__name__)
 memory = ContextMemory()
 
 
@@ -66,7 +69,7 @@ class DocumentQuery:
                  request, or if the server responds with an error, a string
                  prefixed with "Error:" is returned detailing the issue.
         """
-        server_url = os.getenv("MCP_SERVER_URL", f"{MCP_SERVER_URL}/rag_ask")
+        server_url = os.getenv("ASK_PANDA_BASE_URL", f"{ASK_PANDA_BASE_URL}/rag_ask")
 
         # Construct prompt
         prompt = ""
@@ -149,7 +152,7 @@ def main() -> None:
     # Check server health before proceeding
     ec = check_server_health()
     if ec == EC_TIMEOUT:
-        logger.warning(f"Timeout while trying to connect to {MCP_SERVER_URL}.")
+        logger.warning(f"Timeout while trying to connect to {ASK_PANDA_BASE_URL}.")
         sleep(10)  # Wait for a while before retrying
         ec = check_server_health()
         if ec:

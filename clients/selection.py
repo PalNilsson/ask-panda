@@ -18,8 +18,12 @@
 # Authors:
 # - Paul Nilsson, paul.nilsson@cern.ch, 2025
 
-import argparse
+from logging_config import setup_logging
+setup_logging("selection")
 import logging
+logger = logging.getLogger(__name__)
+
+import argparse
 import os
 import re
 import requests
@@ -32,9 +36,8 @@ from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
-from tools.server_utils import MCP_SERVER_URL, check_server_health
+from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
 
-logger = logging.getLogger(__name__)
 memory = ContextMemory()
 
 
@@ -143,7 +146,7 @@ Output only one of the categories: document, queue, task, log, or pilot.
             str or dict: The answer from the LLM, or a dictionary containing the session ID, if
             returnstring is False. If returnstring is True, returns the answer as a string.
         """
-        server_url = os.getenv("MCP_SERVER_URL", f"{MCP_SERVER_URL}/rag_ask")
+        server_url = os.getenv("ASK_PANDA_BASE_URL", f"{ASK_PANDA_BASE_URL}/rag_ask")
 
         # Construct prompt
         prompt = question
@@ -344,7 +347,7 @@ def main() -> None:
     # Check server health before proceeding
     ec = check_server_health()
     if ec == EC_TIMEOUT:
-        logger.warning(f"Timeout while trying to connect to {MCP_SERVER_URL}.")
+        logger.warning(f"Timeout while trying to connect to {ASK_PANDA_BASE_URL}.")
         sleep(10)  # Wait for a while before retrying
         ec = check_server_health()
         if ec:

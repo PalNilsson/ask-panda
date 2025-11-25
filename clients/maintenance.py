@@ -18,8 +18,12 @@
 # Authors:
 # - Paul Nilsson, paul.nilsson@cern.ch, 2025
 
-import argparse
+from logging_config import setup_logging
+setup_logging("maintenance")
 import logging
+logger = logging.getLogger(__name__)
+
+import argparse
 import os
 import psutil
 import sys
@@ -28,12 +32,11 @@ import time
 from fastmcp import FastMCP
 from time import sleep
 
+from tools.config import config
 from tools.errorcodes import EC_TIMEOUT
 from tools.https import download_data
-from tools.server_utils import MCP_SERVER_URL, check_server_health
+from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
 from tools.tools import reformat_errors
-
-logger = logging.getLogger(__name__)
 
 mcp = FastMCP("panda")
 
@@ -45,7 +48,7 @@ def main():
     # Check server health before proceeding
     ec = check_server_health()
     if ec == EC_TIMEOUT:
-        logger.warning(f"Timeout while trying to connect to {MCP_SERVER_URL}.")
+        logger.warning(f"Timeout while trying to connect to {ASK_PANDA_BASE_URL}.")
         sleep(10)  # Wait for a while before retrying
         ec = check_server_health()
         if ec:
@@ -66,7 +69,7 @@ def main():
     args = parser.parse_args()
 
     # download error data from the given url every 24h, 12h, 6h, 3h, 1h
-    url_errors = "https://bigpanda.cern.ch/errors/?json&hours=NNN&limit=10000000&fields=errsBySite"
+    url_errors = f"{config.Urls.bigpanda}/errors/?json&hours=NNN&limit=10000000&fields=errsBySite"
     prefix = "error_data"
     error_data = {24: f"{prefix}_24h.json",
                   12: f"{prefix}_12h.json",
