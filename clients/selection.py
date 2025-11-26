@@ -14,7 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
 # Authors:
 # - Paul Nilsson, paul.nilsson@cern.ch, 2025
 
@@ -34,6 +33,7 @@ from time import sleep
 from clients.document_query import DocumentQuery
 from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
+from clients.panda_mcp import PanDAMCPClient
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
 from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
@@ -70,25 +70,29 @@ class Selection:
 You are a routing assistant for a question-answering system. Your job is to classify a question into one of the following categories, based on its topic:
 
 - document:
-    Questions about general usage, concepts, how-to guides, or explanation of systems (e.g. PanDA, prun, pathena, containers, error codes).
+    Questions about general usage, concepts, how-to guides, or error messages that are answered from documentation
+    or long-form knowledge of systems (e.g. PanDA, prun, pathena, containers, error codes).
 - queue:
-    Questions about site or queue data stored in a JSON file (e.g. corepower, copytool, status of a queue, which queues use rucio).
+    Questions about site or queue data stored in a JSON file (e.g. queues at a site, corepower, copytool, status of a queue, which queues use rucio).
 - log_analyzer:
     Questions about why a specific job failed (e.g. log or failure analysis of job NNN).
     The word 'job', 'pandaid' or 'panda id' must be followed by a number.
-    If the last line in the question is a number and the user previously asked about a job, you should assume it is a job id and select the 'job' category.
+    If the last line in the question is a number and the user provides no other hint, you should assume it is a job id and select the 'job' category.
 - task:
     Questions about a specific task's status or job counts (e.g. status of task NNN, number of failed jobs).
     The word 'task' or 'task id' or 'taskid' must be followed by a number.
-    If the last line in the question is a number and the user previously asked about a task, you should assume it is a task id and select the 'task' category.
-- pilot_activity: Questions about pilot activity, failures, or statistics, possibly involving Grafana (e.g. pilots running on queue X, pilots failing, links to
-Grafana).
+    If the last line in the question is a number and the user provides no other hint, you should assume it is a task id and select the 'task' category.
+- pilot_activity: Questions about pilot activity, failures, or statistics, possibly using information from Grafana
+    (e.g. pilots running on queue X, pilots failing, links to Grafana).
+- panda_mcp:
+    Questions about whether the PanDA MCP server is alive, reachable or running
+    (e.g. "Is the server alive?", "Is the PanDA server running?", "PanDA MCP status").
 
 Classify the following question:
 
 "{question}"
 
-Output only one of the categories: document, queue, task, log, or pilot.
+Output only one of the categories: document, queue, log_analyzer, task, pilot_activity, or panda_mcp.
 """
         result = self.ask(prompt, returnstring=True).strip().lower()
         return result if result in self.clients else "document"
@@ -103,10 +107,23 @@ Output only one of the categories: document, queue, task, log, or pilot.
             question (str): The question to classify.
 
         Returns:
-            str: The category of the question ("document", "task", "log_analyzer", or "undefined").
+            str: The category of the question ("document", "task", "log_analyzer", "panda_mcp", or "undefined").
         """
         # Normalize text (case-insensitive matching)
         q = question.lower()
+
+        # Quick detection of PanDA MCP / server-status questions
+        panda_mcp_keywords = (
+            "panda mcp",
+            "panda mcp status",
+            "panda mcp server",
+            "panda server status",
+            "is the server alive",
+            "is the panda server running",
+            "is panda server running",
+        )
+        if any(keyword in q for keyword in panda_mcp_keywords):
+            return "panda_mcp"
 
         # Regex patterns for task and job with numbers
         task_pattern = r'\b(task|task id|taskid)\s*\d+'
@@ -114,23 +131,23 @@ Output only one of the categories: document, queue, task, log, or pilot.
 
         # Check for 'task' conditions
         if re.search(task_pattern, q):
-            return 'task'
+            return "task"
 
         # Check for 'job' conditions
         if re.search(job_pattern, q):
-            return 'log_analyzer'
+            return "log_analyzer"
 
         # If not matched, check for both 'task' and 'job' words (not necessarily with numbers)
-        if 'task' in q or 'job' in q:
-            # if the last line a "User: " followed by a number we cannot classify it here
+        if "task" in q or "job" in q:
+            # if the last line is a "User: " followed by a number we cannot classify it here
             lines = q.strip().splitlines()
             if lines and re.match(r'^user:\s*\d+$', lines[-1].strip()):
-                return 'undefined'
+                return "undefined"
 
-            return 'document'
+            return "document"
 
         # Default case
-        return 'undefined'
+        return "undefined"
 
     def answer(self, question: str) -> str:
         return self.classify_question(question)
@@ -138,6 +155,11 @@ Output only one of the categories: document, queue, task, log, or pilot.
     def ask(self, question: str, returnstring=False) -> str or dict:
         """
         Send a question to the LLM via the MCP server and retrieve the answer.
+
+        This function sends the question and the selected model to the
+        ASK_PANDA_BASE_URL server endpoint using a POST request. It expects a
+        JSON response containing the answer. If the response indicates an error
+        (with a non-200 status code), an error message is returned instead.
 
         Args:
             question (str): The question to ask the LLM.
@@ -184,8 +206,12 @@ Output only one of the categories: document, queue, task, log, or pilot.
                     pass
                 # Fallback if JSON parsing fails or "detail" is not in a dict
                 return f"Error: Server returned status {response.status_code} - {response.text}"
-        except requests.exceptions.RequestException as e:
-            return f"Error: Network issue or server unreachable - {e}"
+        except requests.exceptions.Timeout:
+            return f"Error: Request to {server_url} timed out."
+        except requests.exceptions.ConnectionError:
+            return f"Error: Failed to connect to {server_url}."
+        except Exception as e:
+            return f"Error: An unexpected error occurred: {str(e)}."
 
 
 def get_clients(model: str, session_id: str or None, pandaid: str or None, taskid: str or None, cache: str) -> dict:
@@ -202,12 +228,28 @@ def get_clients(model: str, session_id: str or None, pandaid: str or None, taski
     Returns:
         dict: A dictionary mapping client categories to their respective client classes.
     """
+    # PanDA MCP configuration (can be overridden via environment variables)
+    panda_mcp_host = os.getenv("PANDA_MCP_HOST", "pandaserver01.sdcc.bnl.gov")
+    panda_mcp_port = int(os.getenv("PANDA_MCP_PORT", "25443"))
+    panda_mcp_transport = os.getenv("PANDA_MCP_TRANSPORT", "streamable-http")
+    panda_mcp_use_http = os.getenv("PANDA_MCP_USE_HTTP", "false").lower() == "true"
+    panda_mcp_token = os.getenv("PANDA_MCP_TOKEN")
+    panda_mcp_vo = os.getenv("PANDA_MCP_VO", "atlas")
+
     return {
         "document": DocumentQuery(model, session_id),
         "queue": None,
         "task": TaskStatus(model, taskid, cache, session_id) if session_id and taskid else None,
         "log_analyzer": LogAnalysis(model, pandaid, cache, session_id) if pandaid else None,
-        "pilot_activity": None
+        "pilot_activity": None,
+        "panda_mcp": PanDAMCPClient(
+            host=panda_mcp_host,
+            port=panda_mcp_port,
+            transport=panda_mcp_transport,
+            use_http=panda_mcp_use_http,
+            token=panda_mcp_token,
+            vo=panda_mcp_vo,
+        ),
     }
 
 
@@ -247,7 +289,7 @@ def extract_task_id(text: str) -> int or None:
     return None
 
 
-def figure_out_clients(question: str, model: str, session_id: str, cache: str = None, task_id: int = None, panda_id: int = None) -> dict:
+def figure_out_clients(question: str, model: str, session_id: str = None, cache: str = "cache", task_id: int = None, panda_id: int = None) -> dict:
     """
     Determine the appropriate client to handle the given question.
 
@@ -270,62 +312,37 @@ def figure_out_clients(question: str, model: str, session_id: str, cache: str = 
     return get_clients(model, session_id, pandaid, taskid, cache)
 
 
-def extract_keyword_and_number(text: str):
+def get_id(input_str: str) -> int or None:
     """
-    Extracts keyword and number from text.
+    Extract an integer from the user-inputted string, accounting for commas, periods, and spaces.
 
-    Supports 'task', 'task id', 'taskid', 'job', 'job id', 'pandaid', 'panda id'.
-    Returns (keyword, number) or (None, None) if not found.
-    """
-    # Regex pattern:
-    # - matches one of the keywords
-    # - allows optional space between word and "id"
-    # - captures the keyword and the number
-    pattern = re.compile(r"\b(task(?:\s*id)?|job(?:\s*id)?|panda(?:\s*id)?)\s*(\d+)\b", re.IGNORECASE)
-
-    match = pattern.search(text)
-    if match:
-        keyword = match.group(1).lower().replace(" ", "")  # normalize: "task id" -> "taskid"
-        number = match.group(2)
-
-        return keyword, number
-
-    return None, None
-
-
-def get_id(prompt: str) -> int or None:
-    """
-    Extract a task or job ID from the given text using a regular expression.
-
-    It is assumed that the ID is provided on the last line of the prompt,
-
-    Args:
-        prompt: The text from which to extract the task ID.
+    Parameters:
+        input_str (str): The string containing the integer.
 
     Returns:
-        int or None: The extracted task ID as an integer, or None if no task ID is found.
+        Optional[int]: The extracted integer, or None if no valid integer is found.
     """
-    lines = prompt.strip().splitlines()
-    # remove all lines that do not start with "User: "
-    lines = [line for line in lines if line.strip().lower().startswith("user:")]
-    logger.info(f"lines to check for id: {lines}")
 
-    for line in lines:
-        _, number = extract_keyword_and_number(line)
-        if number:
-            return int(number)
+    # Use a regular expression to match numbers with commas, spaces, or periods as separators
+    match = re.findall(r'[-+]?\d[\d,.\s]*', input_str)
 
-    match = re.match(r'^user:\s*(\d+)$', lines[-1].strip().lower())
-    if lines and match:
+    # If a match is found, clean the string and convert to int
+    if match:
+        # Clean the number string by removing commas, spaces, and periods
+        cleaned_number = match[0]
+        cleaned_number = cleaned_number.replace(',', '').replace(' ', '')
+        if cleaned_number.count('.') <= 1:
+            stringlist = cleaned_number.split(".")
+            intstring = ""
+            for number in stringlist:
+                intstring += number
+            cleaned_number = intstring
         try:
-            taskid = int(match.group(1))
-            logger.info(f"Extracted Task/Job ID from last line: {taskid}")
+            return int(cleaned_number)
         except ValueError:
-            logger.warning("Could not extract Task/Job ID from the last line.")
-        return taskid
-    else:
-        logger.info(f"Failed to extract Task/Job ID from last line: {lines[-1].strip() if lines else 'N/A'}")
+            pass  # return None if conversion fails
 
+    # Return None if no match is found or conversion fails
     return None
 
 
@@ -388,6 +405,7 @@ def main() -> None:
     selection_client = Selection(clients, args.model)
 
     last_question = args.question
+
     prompt = ""
     if args.session_id != "None":
         # Retrieve context
@@ -419,6 +437,12 @@ def main() -> None:
         question = client.generate_question("pilotlog.txt")
         answer = client.ask(question)
         logger.info(f"Final answer (log analyzer):\n{answer}")
+        return answer
+    elif category == "panda_mcp":
+        logger.info(f"Selected client category: {category} (PanDAMCPClient)")
+        # PanDAMCPClient only needs the latest user question, not the full prompt history.
+        answer = client.answer_prompt_sync(args.question)
+        logger.info(f"Final answer (panda_mcp):\n{answer}")
         return answer
     elif category == "task":
         logger.info(f"Selected client category: {category} (TaskStatus)")
