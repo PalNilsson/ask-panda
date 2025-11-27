@@ -121,7 +121,71 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🐼 Ask PanDA – Chat")
+# ---- ChatGPT-like styling for the page and chat input ----
+CHATGPT_CSS = """
+<style>
+
+/* White main background */
+[data-testid="stAppViewContainer"] {
+    background: white !important;
+}
+
+/* ChatGPT-like centered main column */
+section[data-testid="stMain"] > div {
+    max-width: 900px;
+    margin: 0 auto;
+}
+
+/* Input container spacing */
+div[data-testid="stChatInput"] {
+    padding-top: 12px;
+    padding-bottom: 24px;
+}
+
+/* Chat input wrapper */
+div[data-testid="stChatInput"] > div {
+    border-radius: 18px !important;
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    background: #f2f2f2 !important;  /* light gray */
+}
+
+/* The textarea itself */
+div[data-testid="stChatInput"] textarea {
+    min-height: 75px !important;      /* adjust to your liking */
+    max-height: 250px !important;
+    padding: 26px 18px !important;
+    display: flex;
+    align-items: center;
+    font-size: 1rem !important;
+    line-height: 1.4 !important;
+    resize: none !important;
+    border-radius: 12px !important;
+    border: none !important;
+    background: #f2f2f2 !important;   /* light gray */
+    color: #000 !important;
+}
+
+div[data-testid="stChatInput"] > div:focus-within {
+    outline: none !important;
+    box-shadow: none !important;
+    border-color: rgba(0,0,0,0.2) !important;  /* keep your neutral border */
+}
+/* Placeholder color */
+div[data-testid="stChatInput"] textarea::placeholder {
+    color: #666 !important;
+}
+
+/* Button tweaks */
+div[data-testid="stChatInput"] button[kind="primary"] {
+    border-radius: 999px !important;
+}
+
+</style>
+"""
+
+st.markdown(CHATGPT_CSS, unsafe_allow_html=True)
+
+st.title("🐼 Ask PanDA")
 
 # Initialize multi-chat state
 ensure_chat_state()
@@ -276,7 +340,7 @@ for msg in current_chat["messages"]:
 
 
 # ---- Chat input (bottom) ----
-prompt = st.chat_input("Type your question and press Enter…")
+prompt = st.chat_input("Send a message...")
 
 if prompt:
     if not model.strip():
