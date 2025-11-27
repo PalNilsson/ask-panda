@@ -9,7 +9,7 @@ Nov, 2025
 import re
 import shutil
 from pathlib import Path
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
@@ -17,6 +17,7 @@ curr_dir = Path(__file__).parent
 target_dir = curr_dir.parent / "resources"
 inputfile = target_dir / "cric_schema.txt"
 embedder = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
 
 def ToVecDB():
     with open(inputfile, "r") as f:
@@ -43,24 +44,25 @@ def ToVecDB():
         text = None
         if rest:
             text = f"Table {table_name} field {field} type {datatype} example {rest}."
-        else:        
+        else:
             text = f"Table {table_name} field {field} type {datatype}."
 
         schema_parse.append(
-            Document(page_content=text, metadata={"table": table_name, "field": field, 
-                                                "type": datatype, "example": rest})
+            Document(page_content=text, metadata={"table": table_name, "field": field, "type": datatype, "example": rest})
         )
+
     # remove the existing vector db
     if (target_dir / "schemaDB").exists():
         shutil.rmtree(target_dir / "schemaDB")
     # save the new vector db
     Chroma.from_documents(schema_parse, embedder, persist_directory=str(target_dir / "schemaDB"))
-    print( "Txt 2 Database Transformation Finished.")
+    print("Txt 2 Database Transformation Finished.")
     f.close()
     return
 
-def checkDB(field:str):
-    db = Chroma(persist_directory = str(target_dir / "schemaDB"), embedding_function = embedder)
+
+def checkDB(field: str):
+    db = Chroma(persist_directory=str(target_dir / "schemaDB"), embedding_function=embedder)
     # search for a specific field
     results = db.get(where={"field": field})
     if not results["ids"]:
@@ -70,6 +72,7 @@ def checkDB(field:str):
         for i, (content, meta) in enumerate(zip(results["documents"], results["metadatas"]), 1):
             print(f"{meta}")
     return
+
 
 if __name__ == "__main__":
     ToVecDB()
