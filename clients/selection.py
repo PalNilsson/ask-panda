@@ -30,6 +30,7 @@ from time import sleep
 from clients.document_query import DocumentQuery
 from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
+from clients.CRICanalysis import CRICanalysisClient
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
 from tools.server_utils import MCP_SERVER_URL, check_server_health
@@ -208,9 +209,15 @@ def get_clients(model: str, session_id: str or None, pandaid: str or None, taski
     Returns:
         dict: A dictionary mapping client categories to their respective client classes.
     """
+    from pathlib import Path
+
+    # Construct path to CRIC schema
+    current_dir = Path(__file__).parent
+    schema_path = str(current_dir.parent / "resources" / "cric_schema.txt")
+
     return {
         "document": DocumentQuery(model, session_id),
-        "queue": None,
+        "queue": CRICanalysisClient(schema_path, model=model),
         "task": TaskStatus(model, taskid, cache, session_id) if session_id and taskid else None,
         "log_analyzer": LogAnalysis(model, pandaid, cache, session_id) if pandaid else None,
         "pilot_activity": None

@@ -14,6 +14,7 @@ command line interfaces that allow for interaction with various AI models.
 
 # Features
 - **Multi-Model Support**: Interact with various AI models including OpenAI, Anthropic, Gemini, and Llama.
+- **CRIC Database Integration**: Query PanDA site and queue operational data using natural language. The CRIC client uses LLM-powered SQL generation with validation to answer questions about computing resources, queue configurations, and site capabilities.
 - **Customizable**: Easily add or modify models and their configurations.
 - **User-Friendly**: Simple command-line interface for easy interaction.
 - **Lightweight**: Minimal dependencies for quick setup and deployment.
