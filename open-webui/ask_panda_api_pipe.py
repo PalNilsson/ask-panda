@@ -5,7 +5,6 @@ This pipe calls the ask-panda HTTP API instead of importing Python code directly
 Much simpler and avoids dependency conflicts!
 """
 
-from typing import Any, List, Dict
 from pydantic import BaseModel, Field
 import requests
 
@@ -25,17 +24,30 @@ class Pipe:
         self.name = "Ask PanDA"
         self.valves = self.Valves()
 
-    def pipe(
+    async def pipe(
         self,
-        user_message: str,
-        model_id: str,
-        messages: List[Dict[str, Any]],
-        body: Dict[str, Any],
+        body: dict,
+        __metadata__: dict = None,
+        __event_call__: dict = None
     ) -> str:
+        # get session id for history memory
+        session_id = (__metadata__ or {}).get("chat_id")
+
+        # filter out UI generated follow up questions
+        meta_type = (__metadata__ or {}).get("type")
+        is_followup = (__event_call__ in {"follow_ups", "followups"}) or (meta_type and meta_type != "user_response")
+
+        if (is_followup):
+            print("NO FOLLOW-UPS")
+            return {"follow_ups": []}
+        # User lastest question
+        lastest_question = body["messages"][-1]["content"]
+
+
         try:
             r = requests.post(
                 self.valves.ask_panda_url,
-                json={"question": user_message, "model": self.valves.model},
+                json={"question": lastest_question, "model": self.valves.model},
                 timeout=90,
             )
             r.raise_for_status()

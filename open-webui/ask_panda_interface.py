@@ -78,7 +78,7 @@ class Pipe:
         if not user_valves:
             user_valves = self.UserValves()
 
-        model = "mistral"
+        model = "gemini"
 
         # user_id = __user__.get("id")
         last_assistant_message = body["messages"][-1]
@@ -129,7 +129,7 @@ class Pipe:
                 dialogue_str,
                 model,
                 session_id,
-                cache="/Users/nilsnilsson/Development/ask-panda/cache",
+                cache="/Users/ruixue/ask-panda/cache",
             )
             selection_client = Selection(clients, model)
             category = selection_client.answer(dialogue_str)
@@ -181,6 +181,8 @@ class Pipe:
 
                 question = client.generate_question()
                 answer = client.ask(question)
+            elif category == "CRIC_analyzer":
+                answer = client.ask(prompt)
             else:
                 answer = "Not yet implemented"
                 print(answer)

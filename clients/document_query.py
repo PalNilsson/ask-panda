@@ -53,7 +53,7 @@ class DocumentQuery:
         self.model = model  # e.g., OpenAI or Anthropic wrapper
         self.session_id = session_id  # Session ID for tracking conversation
 
-    def ask(self, question: str) -> str:
+    async def ask(self, question: str) -> str:
         """
         Send a question to the RAG server and retrieve the answer.
 
@@ -133,6 +133,27 @@ class DocumentQuery:
         except requests.exceptions.RequestException as e:
             return f"Error: Network issue or server unreachable - {e}"
 
+    def rag_ask_prompt(self, question: str) -> str:
+        """
+        Generate the question, called by server locally
+        """
+        # Construct prompt
+        prompt = ""
+
+        # If session_id is provided, retrieve context from memory
+        # (it might not be set e.g. from OpenWebUI since that can handle memory itself)
+        if self.session_id != "None":
+            # Retrieve context
+            history = memory.get_history(self.session_id)
+
+            for user_msg, client_msg in history:
+                prompt += f"User: {user_msg}\nAssistant: {client_msg}\n"
+        prompt += f"User: {question}\nAssistant:"
+        # prompt += "If the question is unclear, reply with \'How can I help you with PanDA?\'.\n"
+        prompt += "You are a friendly and helpful assistant that answers questions about the PanDA system."
+        prompt += "Answer the question from the user in as detailed way as possible, using the provided documentation."
+        prompt += "Be sure to include any image references (including in markdown format) in your answer if they are mentioned in the documentation."
+        return prompt
 
 def main() -> None:
     """

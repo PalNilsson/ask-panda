@@ -9,15 +9,14 @@ Nov, 2025
 import re
 import shutil
 from pathlib import Path
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.docstore.document import Document
 from langchain_chroma import Chroma
+import tools.embedder as _embedder
 
 curr_dir = Path(__file__).parent
 target_dir = curr_dir.parent / "resources"
 inputfile = target_dir / "cric_schema.txt"
-embedder = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
+embedder = _embedder.get_embedder()
 
 def ToVecDB():
     with open(inputfile, "r") as f:

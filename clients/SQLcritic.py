@@ -1,4 +1,10 @@
 '''
+
+generate all docstrings with google style type hints
+pylint
+flake8
+
+
 SQL crtiticize client.
 
 This client is designed to make sure that the SQL query is safe and reasonable to be executed.
@@ -30,14 +36,14 @@ Rui Xue, r.xue@cern.ch
 Nov, 2025
 '''
 
-import sys
 import os
 import re
 from pathlib import Path
 from sql_metadata import Parser
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 import google.generativeai as genai
+import tools.embedder as _embedder
+import tools.txt2vecdb as txt2vecdb
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
@@ -45,16 +51,33 @@ gemini_model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 curr_dir = Path(__file__).parent
 target_dir = curr_dir.parent / "resources"
-embedder = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-db = Chroma(persist_directory = str(target_dir / "schemaDB"), embedding_function = embedder)
 
-# fetch all schema names as fields
-fields = set()
-for meta in db.get()["metadatas"]:
-    field = meta.get("field")
-    if field:
-        fields.add(field)
-fields = sorted(list(fields))
+db = None
+schema_fields = None
+
+def get_db():
+    global db
+    if db is None:
+        current_dir = Path(__file__).parent
+        if not (current_dir.parent / "resources" / "schemaDB").exists():
+            txt2vecdb.ToVecDB()
+        
+        db = Chroma(
+            persist_directory=str(target_dir / "schemaDB"),
+            embedding_function=_embedder.get_embedder(),
+        )
+    return db
+
+def get_schema_fields():
+    global schema_fields
+    if schema_fields is None:
+        schema_fields = set()
+        for meta in get_db().get()["metadatas"]:
+            schema = meta.get("field")
+            if schema:
+                schema_fields.add(schema)
+        schema_fields = sorted(list(schema))
+    return schema_fields
 
 
 def FilterFields(query: str) -> list[str]:
@@ -64,7 +87,7 @@ def FilterFields(query: str) -> list[str]:
     '''
     parser = Parser(query)
     
-    
+
     fields = set()
     for key in ("where", "having", "on", "group_by"):
         ff = parser.columns_dict.get(key, [])
@@ -86,14 +109,15 @@ def FilterFields(query: str) -> list[str]:
 
 class SQLcriticClient():
 
-    def __init__(self, question:str, query:str):
+    def __init__(self, question: str, query: str):
         self.question = question
         self.query    = query
-        self.schema_list = fields
+        self.schema_list = get_schema_fields()
 
     def extract_fields(self, query:str) -> list[str]:
         fields = FilterFields(query)
         contents = []
+        db = get_db()
         for field in fields:
             # print(field)
             result = db.get(where={"field": field})
@@ -114,7 +138,7 @@ class SQLcriticClient():
             False, reasons...
         '''
 
-        field_contents = self.extract_fields(self.query)
+        field_contents = "\n".join(self.extract_fields(self.query))
         prompt = f"""
         You are an expert on ATLAS PanDA CRIC (Computing Resource Information Catalogue) database system.
         Your job is to review the SQL query and verify whether it is appropriate and safe to answer the user's question.
@@ -127,7 +151,7 @@ class SQLcriticClient():
         {self.query}
 
         Database schema (table name, field name, data type, and examples if available):
-        {"\n".join(field_contents)}
+        {field_contents}
 
         All available schema:
         {",".join(self.schema_list)}
@@ -170,8 +194,7 @@ class SQLcriticClient():
         Return your answer strictly as a string:
         True,None   or   False,reason ...
         
-        No extra commentary.
-        """
+        No extra commentary."""
         response = gemini_model.generate_content(prompt)
         ans = tuple(map(str, response.text.strip().split(",",1)))
         _bool = ans[0].strip().lower() == "true"

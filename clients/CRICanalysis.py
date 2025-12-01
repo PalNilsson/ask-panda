@@ -49,9 +49,9 @@ import argparse
 import numpy as np
 import google.generativeai as genai
 from pathlib import Path
-from langchain_huggingface import HuggingFaceEmbeddings
-from keybert import KeyBERT
-from SQLcritic import SQLcriticClient
+from clients.SQLcritic import SQLcriticClient
+from tools.context_memory import ContextMemory
+import tools.embedder as _embedder
 
 MAX_DISCUSS = 3
 FIELDS_LIMIT = 10
@@ -61,13 +61,13 @@ TABLE = "queuedata"
 current_dir = Path(__file__).parent
 
 sys.path.append(str(current_dir.parent / "tools"))
-import txt2vecdb
+# import tools.txt2vecdb as txt2vecdb
 
 # if the vector database does not exist, 
 # call txt2vecdb function to convert schema.txt to schemaDB
-if not (current_dir.parent / "resources" / "schemaDB").exists():
-    txt2vecdb.ToVecDB()
-    print("Schema Vector Database Generated! \n")
+# if not (current_dir.parent / "resources" / "schemaDB").exists():
+#     txt2vecdb.ToVecDB()
+    # print("Schema Vector Database Generated! \n")
 
 schema_path = current_dir.parent / "resources" / "cric_schema.txt"
 CRICdb_path = current_dir.parent / "resources" / "queuedata.db"
@@ -75,9 +75,10 @@ CRICdb_path = current_dir.parent / "resources" / "queuedata.db"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("models/gemini-2.5-flash")
-keyword_model = KeyBERT(model="all-MiniLM-L6-v2")
-embedder = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+keyword_model = _embedder.get_keybert()
+embedder = _embedder.get_embedder()
 
+memory = ContextMemory()
 
 def cos_sim(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -90,7 +91,7 @@ def ans_yes_or_no(response: str) -> bool:
     sim_yes = cos_sim(emb_resp, emb_yes)
     sim_no = cos_sim(emb_resp, emb_no)
 
-    print(f"sim_yes={sim_yes:.3f}, sim_no={sim_no:.3f}")
+    # print(f"sim_yes={sim_yes:.3f}, sim_no={sim_no:.3f}")
     return sim_yes > sim_no
 
 def need_CRIC(question: str) -> bool:
@@ -153,7 +154,7 @@ def need_CRIC(question: str) -> bool:
     resp = gemini_model.generate_content(classifier_prompt)
     prompt_tokens = resp.usage_metadata.prompt_token_count
     total_tokens  = resp.usage_metadata.total_token_count
-    print("\n Classifier Prompt Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
+    # print("\n Classifier Prompt Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
     resp_text = getattr(resp, "text", "").strip().lower()
     if "yes" in resp_text: return True
     if "no"  in resp_text: return False
@@ -191,7 +192,7 @@ def llm_suggest_fields(question: str, schema_text: str) -> list[str]:
     response = gemini_model.generate_content(prompt)
     prompt_tokens = response.usage_metadata.prompt_token_count
     total_tokens  = response.usage_metadata.total_token_count
-    print("\n Field Suggestor Prompt Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
+    # print("\n Field Suggestor Prompt Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
     ans = response.text.strip() if response and response.text else ""
     fields = [f.strip() for f in ans.split(",") if f.strip()]
 
@@ -252,9 +253,12 @@ def llm_generate_SQL(question: str, fields: list[str]) -> str:
 
     if "```sql" in sql_text or "```" in sql_text:
         sql_text = sql_text.replace("```sql", "").replace("```", "").strip()
-    print("\n SQL generation Prompt Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
+    # print("\n SQL generation Prompt Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
 
     return sql_text
+
+def is_CRIC_related(question: str) -> bool:
+    return need_CRIC(question)
 
 class CRICanalysisClient:
     """
@@ -263,8 +267,9 @@ class CRICanalysisClient:
     3. Execute the SQL lines and get results.
     4. Summarize the results and generate the context for answering.
     """
-    def __init__(self, schema_path: str):
+    def __init__(self, schema_path: str, session_id: str | None = None):
         self.schema_path = Path(schema_path)
+        self.session_id  = session_id
         self.schema_text = self.schema_path.read_text(encoding="utf-8")
         self.SQLquery = None
 
@@ -334,16 +339,47 @@ class CRICanalysisClient:
         resp = gemini_model.generate_content(prompt)
         prompt_tokens = resp.usage_metadata.prompt_token_count
         total_tokens  = resp.usage_metadata.total_token_count
-        print("\nFinal Answer Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
+        # print("\nFinal Answer Tokens: ", prompt_tokens, ", Total Tokens: ", total_tokens)
         resp_text = getattr(resp, "text", "").strip()
+
+        # store the answer in the session memory
+        if self.session_id != "None":
+            memory.store_turn(self.session_id, "CRIC DATA Analysis", resp_text)
+            # TODO add logger document
+
         return resp_text
 
+    def ask(self, question: str) -> str:
+        critic_client = SQLcriticClient(question, None)
+        fields = self.suggest_fields(question)
+        ques = str(question)
+        # two client discussion, no more than MAX_DISCUSS rounds
+        _bool = True
+        for _ in range(MAX_DISCUSS):
+            SQLquery = self.generate_SQL(ques, fields)
+            critic_client.query = SQLquery
+            _bool, _suggestion = critic_client.criticize()
+            if (_bool):
+                break
+            ques = str(question) + _suggestion
+        if not _bool:
+            ans = f"Cannot generate reasonable SQL query within {MAX_DISCUSS} rounds. \n Please rephrase the question instead. \n"
+            return ans
+
+        result = self.execute_SQL(SQLquery)
+        if (result["success"]):
+            ans = "\nAnswer by Gemini: \n"
+            ans += self.Answer_with_Context(question,result["data"])
+            return ans
+        else:
+            ans = f"Failed to execute {SQLquery}"
+            return ans
 
 def workflow(args):
 
-    client = CRICanalysisClient(schema_path)
+    client = CRICanalysisClient(schema_path, args.session_id)
     critic_client = SQLcriticClient(args.question, None)
-
+    print("Question: ", args.question)
     if (client.is_related(args.question)):
         fields = client.suggest_fields(args.question)
 
@@ -379,6 +415,7 @@ def workflow(args):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Suggest CRIC fields for a question")
-    parser.add_argument("--question", "-q", required=True, help="Natural-language question about CRIC")
+    parser.add_argument("--question", "-q", type = str, required=True, help = "Natural-language question about CRIC")
+    parser.add_argument("--session-id", type = str, default = None, help = "Session ID for the context memory")
     args = parser.parse_args()
     workflow(args)

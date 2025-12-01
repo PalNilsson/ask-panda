@@ -34,6 +34,7 @@ from clients.document_query import DocumentQuery
 from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
 from clients.panda_mcp import PanDAMCPClient
+from clients.CRICanalysis import CRICanalysisClient, is_CRIC_related, schema_path
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
 from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
@@ -58,13 +59,17 @@ class Selection:
             question (str): The question to classify.
 
         Returns:
-            str: The category of the question (e.g., "document", "queue", "task", "log_analyzer", "pilot_activity").
+            str: The category of the question (e.g., "document", "queue", "task", "log_analyzer", "pilot_activity", "CRIC_analyzer").
         """
         # no need to involve the LLM if we can classify it with simple rules
         initial = self.simple_classification(question)
         logger.info(f"Initial classification: {initial}")
         if initial != "undefined":
             return initial
+
+        # if related to CRIC, return directly
+        if is_CRIC_related(question):
+            return "CRIC_analyzer"
 
         prompt = f"""
 You are a routing assistant for a question-answering system. Your job is to classify a question into one of the following categories, based on its topic:
@@ -250,6 +255,8 @@ def get_clients(model: str, session_id: str or None, pandaid: str or None, taski
             token=panda_mcp_token,
             vo=panda_mcp_vo,
         ),
+        "pilot_activity": None,
+        "CRIC_analyzer": CRICanalysisClient(schema_path, session_id) # hardcoded schema_path currently
     }
 
 
@@ -413,10 +420,15 @@ def main() -> None:
         for user_msg, client_msg in history:
             prompt += f"User: {user_msg}\nAssistant: {client_msg}\n"
     prompt += f"User: {last_question}"
-    category = selection_client.answer(prompt)
+    category = selection_client.answer(last_question)
     client = clients.get(category)
 
+    print("\n", "#"*10)
+    logger.info(" CATEGORY \n"+f"{category}")
     logger.info(f"Full question:\n{prompt}")
+    print("\n", "#"*10)
+
+    # TODO: Need another agent to summarize the last answer and previous answer, with history memory
 
     if category == "document":
         logger.info(f"Selected client category: {category} (DocumentQuery)")
@@ -460,6 +472,11 @@ def main() -> None:
         question = client.generate_question()
         answer = client.ask(question)
         logger.info(f"Final answer (task):\n{answer}")
+        return answer
+    elif category == "CRIC_analyzer":
+        logger.info(f"Selected client category: {category} (CRICAnalysis)")
+        answer = client.ask(args.question)
+        logger.info(f"Final answer (CRIC analyzer):\n{answer}")
         return answer
     else:
         logger.warning("Not yet implemented")
