@@ -33,7 +33,7 @@ from time import sleep
 from clients.document_query import DocumentQuery
 from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
-from clients.panda_mcp import PanDAMCPClient
+from clients.CRICanalysis import CRICanalysisClient
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
 from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
@@ -228,17 +228,15 @@ def get_clients(model: str, session_id: str or None, pandaid: str or None, taski
     Returns:
         dict: A dictionary mapping client categories to their respective client classes.
     """
-    # PanDA MCP configuration (can be overridden via environment variables)
-    panda_mcp_host = os.getenv("PANDA_MCP_HOST", "pandaserver01.sdcc.bnl.gov")
-    panda_mcp_port = int(os.getenv("PANDA_MCP_PORT", "25443"))
-    panda_mcp_transport = os.getenv("PANDA_MCP_TRANSPORT", "streamable-http")
-    panda_mcp_use_http = os.getenv("PANDA_MCP_USE_HTTP", "false").lower() == "true"
-    panda_mcp_token = os.getenv("PANDA_MCP_TOKEN")
-    panda_mcp_vo = os.getenv("PANDA_MCP_VO", "atlas")
+    from pathlib import Path
+
+    # Construct path to CRIC schema
+    current_dir = Path(__file__).parent
+    schema_path = str(current_dir.parent / "resources" / "cric_schema.txt")
 
     return {
         "document": DocumentQuery(model, session_id),
-        "queue": None,
+        "queue": CRICanalysisClient(schema_path, model=model),
         "task": TaskStatus(model, taskid, cache, session_id) if session_id and taskid else None,
         "log_analyzer": LogAnalysis(model, pandaid, cache, session_id) if pandaid else None,
         "pilot_activity": None,

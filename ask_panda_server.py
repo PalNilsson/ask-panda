@@ -498,32 +498,40 @@ async def agent_ask(request: QuestionRequest) -> dict[str, str]:
     """
     Full agent routing endpoint - routes questions to specialized agents.
     """
-    from agents.selection_agent import SelectionAgent, figure_out_agents
+    from clients.selection import Selection, figure_out_clients
 
     logger.info(f"Agent query: '{request.question}' using model: '{request.model}'")
 
     try:
-        agents = figure_out_agents(
+        clients = figure_out_clients(
             request.question,
             request.model.lower(),
             session_id="api",
             cache="/app/cache"
         )
 
-        selection_agent = SelectionAgent(agents, request.model.lower())
-        category = selection_agent.answer(request.question)
-        agent = agents.get(category)
+        selection = Selection(clients, request.model.lower())
+        category = selection.answer(request.question)
+        client = clients.get(category)
 
         logger.info(f"Routed to: {category}")
 
         if category == "document":
-            answer = agent.ask(request.question)
+            answer = client.ask(request.question)
+        elif category == "queue":
+            if client is None:
+                return {"answer": "Error: CRIC database client is not available.", "category": "document"}
+            answer = client.ask(request.question)
         elif category == "log_analyzer":
-            question = agent.generate_question("pilotlog.txt")
-            answer = agent.ask(question)
+            if client is None:
+                return {"answer": "Error: Please provide a PanDA job ID so I can analyze the logs.", "category": "document"}
+            question = client.generate_question("pilotlog.txt")
+            answer = client.ask(question)
         elif category == "task":
-            question = agent.generate_question()
-            answer = agent.ask(question)
+            if client is None:
+                return {"answer": "Error: Please provide a task ID for status information.", "category": "document"}
+            question = client.generate_question()
+            answer = client.ask(question)
         else:
             answer = "Not yet implemented"
 
