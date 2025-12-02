@@ -66,7 +66,7 @@ current_dir = Path(__file__).parent
 
 sys.path.append(str(current_dir.parent / "tools"))
 import txt2vecdb
-from tools.server_utils import call_model_with_failover
+# from tools.server_utils import call_model_with_failover
 
 # if the vector database does not exist,
 # call txt2vecdb function to convert schema.txt to schemaDB
@@ -108,7 +108,8 @@ def _call_llm(model: str, prompt: str) -> tuple[str, int, int]:
         return response_text, prompt_tokens, total_tokens
     else:
         # Use model with failover (mistral, auto, llama, gpt-oss:20b)
-        response_text = call_model_with_failover(model, prompt)
+        # response_text = call_model_with_failover(model, prompt)
+        response_text = None
         # For non-Gemini models, we don't have token counts
         return response_text, 0, 0
 

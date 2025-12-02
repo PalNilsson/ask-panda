@@ -33,6 +33,7 @@ from time import sleep
 from clients.document_query import DocumentQuery
 from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
+# from clients.panda_mcp import PanDAMCPClient
 from clients.CRICanalysis import CRICanalysisClient
 from tools.context_memory import ContextMemory
 from tools.errorcodes import EC_TIMEOUT
@@ -240,14 +241,14 @@ def get_clients(model: str, session_id: str or None, pandaid: str or None, taski
         "task": TaskStatus(model, taskid, cache, session_id) if session_id and taskid else None,
         "log_analyzer": LogAnalysis(model, pandaid, cache, session_id) if pandaid else None,
         "pilot_activity": None,
-        "panda_mcp": PanDAMCPClient(
-            host=panda_mcp_host,
-            port=panda_mcp_port,
-            transport=panda_mcp_transport,
-            use_http=panda_mcp_use_http,
-            token=panda_mcp_token,
-            vo=panda_mcp_vo,
-        ),
+        # "panda_mcp": PanDAMCPClient(
+        #     host=panda_mcp_host,
+        #     port=panda_mcp_port,
+        #     transport=panda_mcp_transport,
+        #     use_http=panda_mcp_use_http,
+        #     token=panda_mcp_token,
+        #     vo=panda_mcp_vo,
+        # ),
     }
 
 
