@@ -87,7 +87,6 @@ def FilterFields(query: str) -> list[str]:
     '''
     parser = Parser(query)
     
-
     fields = set()
     for key in ("where", "having", "on", "group_by"):
         ff = parser.columns_dict.get(key, [])

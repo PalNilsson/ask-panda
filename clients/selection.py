@@ -68,7 +68,7 @@ class Selection:
             return initial
 
         # if related to CRIC, return directly
-        if is_CRIC_related(question):
+        if is_CRIC_related(question, self.model):
             return "CRIC_analyzer"
 
         prompt = f"""
@@ -256,7 +256,7 @@ def get_clients(model: str, session_id: str or None, pandaid: str or None, taski
             vo=panda_mcp_vo,
         ),
         "pilot_activity": None,
-        "CRIC_analyzer": CRICanalysisClient(schema_path, session_id) # hardcoded schema_path currently
+        "CRIC_analyzer": CRICanalysisClient(schema_path, model=model, session_id=session_id) # hardcoded schema_path currently
     }
 
 

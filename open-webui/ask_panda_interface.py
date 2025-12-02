@@ -129,7 +129,7 @@ class Pipe:
                 dialogue_str,
                 model,
                 session_id,
-                cache="/Users/ruixue/ask-panda/cache",
+                cache="/Users/nilsnilsson/Development/ask-panda/cache",
             )
             selection_client = Selection(clients, model)
             category = selection_client.answer(dialogue_str)
