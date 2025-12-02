@@ -501,13 +501,21 @@ async def agent_ask(request: QuestionRequest) -> dict[str, str]:
     from clients.selection import Selection, figure_out_clients
 
     logger.info(f"Agent query: '{request.question}' using model: '{request.model}'")
-
+    rendering_prompt_openwebui = """
+                                Rewrite the answer in clean Markdown format.
+                                Only output the Markdown format answer.
+                                Do NOT use JSON.
+                                Do NOT use Python dicts.
+                                Do NOT use braces {}.
+                                Do NOT use triple quotes.
+                                Only use headings, lists, bold text, and paragraphs.
+                                """
     try:
         clients = figure_out_clients(
             request.question,
             request.model.lower(),
-            session_id="api",     # TODO: problematic, single session id
-            cache="/app/cache"
+            session_id="777",     # TODO: problematic, single session id
+            cache="/Users/ruixue/ask-panda/cache"
         )
 
         selection_client = Selection(clients, request.model.lower())
@@ -519,13 +527,14 @@ async def agent_ask(request: QuestionRequest) -> dict[str, str]:
         if category == "document":
             rag_prompt = client.rag_ask_prompt(request.question)
             answer = await mcp.rag_query(rag_prompt, request.model)
-            # answer = client.ask(request.question)
-        elif category == "log_analyzer": # TODO: rag_query
+        elif category == "log_analyzer":
             question = client.generate_question("pilotlog.txt")
-            answer = client.ask(question)
-        elif category == "task":         # TODO: rag_query
+            question += rendering_prompt_openwebui
+            answer = await mcp.rag_query(question, request.model)
+        elif category == "task":
             question = client.generate_question()
-            answer = client.ask(question)
+            question += rendering_prompt_openwebui
+            answer = await mcp.rag_query(question, request.model)
         elif category == "CRIC_analyzer":
             answer = client.ask(request.question)
         else:
