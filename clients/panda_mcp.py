@@ -409,32 +409,3 @@ class PanDAMCPClient:
 
         # Last resort: return the raw result.
         return result
-
-    # ------------------------------------------------------------------
-    # Optional helpers (non-essential; do *not* rely on hardcoded tools)
-    # ------------------------------------------------------------------
-    async def ping_any_health_tool(self) -> bool:
-        """
-        Optional helper: try to call a "health"/"is_alive" type tool if present.
-
-        This method does *not* assume a fixed tool name, but tries a few
-        conventional candidates. If none exist, it returns False.
-
-        This is purely a convenience for quick health checks and not intended
-        for core logic.
-        """
-        candidates = ["is_alive", "health", "ping"]
-        tools_by_name = {t.name: t for t in self.list_tools()}
-
-        for name in candidates:
-            if name in tools_by_name:
-                try:
-                    result = await self.call_tool(name, {})
-                    print(result)
-                    # Interpret any successful call as "alive"
-                    return True
-                except Exception:
-                    return False
-
-        # No candidate tool found
-        return False
