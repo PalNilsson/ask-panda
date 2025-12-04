@@ -18,494 +18,423 @@
 # Authors:
 # - Paul Nilsson, paul.nilsson@cern.ch, 2025
 
-""""PanDA MCP client utilities.
+"""
+Generic PanDA MCP client for Ask PanDA.
 
-This module provides:
+This module provides a thin, general-purpose wrapper around the PanDA MCP
+server using fastmcp.Client. It does *not* hardcode any specific tools;
+instead, it exposes generic methods to:
 
-* A factory function ``create_panda_mcp_client`` that returns a plain
-  :class:`fastmcp.Client` configured like the original test client script.
-* A convenience wrapper class :class:`PanDAMCPClient` for higher-level
-  integrations (e.g., Ask PanDA's SelectionAgent).
-* A simple async test function ``cl`` that can be used to verify
-  connectivity and tool calls to the PanDA MCP server.
+- connect to the PanDA MCP endpoint
+- discover available tools (names, descriptions, parameter schemas)
+- call arbitrary tools by name with structured arguments
+
+Intended usage:
+    from clients.panda_mcp import PanDAMCPClient
+
+    async def main():
+        async with PanDAMCPClient.from_env() as client:
+            # 1. Discover tools
+            tools = client.list_tools()
+            for t in tools:
+                print(t.name, "-", t.description)
+
+            # 2. Call a tool dynamically
+            result = await client.call_tool("is_alive", {})
+            print(result)
+
+You can then feed `client.list_tools()` into your LLM as context so it can
+choose which tool to call based on descriptions and argument schemas.
 """
 
 from __future__ import annotations
 
-import argparse
-import asyncio
-from typing import Any, Dict, Optional, Sequence
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional
 
-from fastmcp import Client
+from fastmcp import Client as MCPClient
 from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 
 
-def _normalize_token(token: Optional[str]) -> Optional[str]:
-    """Normalize a token string.
+@dataclass
+class PanDAMCPConfig:
+    """Configuration for connecting to a PanDA MCP server.
 
-    Args:
-        token: Raw token value, possibly ``None`` or an empty string.
+    This configuration supports two styles of environment variables:
 
-    Returns:
-        ``None`` if the input is ``None`` or empty/whitespace-only;
-        otherwise, the stripped token string.
+    New style (preferred):
+        - PANDA_MCP_BASE_URL  (e.g. "http://host:25080/mcp/")
+
+    Legacy style (backward compatible):
+        - PANDA_MCP_HOST      (e.g. "pandaserver01.sdcc.bnl.gov")
+        - PANDA_MCP_PORT      (default: "25080")
+        - PANDA_MCP_PATH      (default: "/mcp/")
+        - PANDA_MCP_USE_HTTP  ("true"/"false"; if "false", use https)
+
+    Common extras (both styles):
+        - PANDA_MCP_USE_SSE   ("1"/"true"/"yes" to use SSE)
+        - PANDA_MCP_TOKEN     (bearer token, optional)
+        - PANDA_MCP_ORIGIN    (Origin header value, optional)
+        - PANDA_MCP_TIMEOUT   (float seconds, optional)
+
+    Attributes:
+        base_url: Base URL of the MCP HTTP endpoint.
+        use_sse: Whether to use SSETransport.
+        auth_token: Optional bearer token for authentication.
+        origin: Optional Origin header value.
+        timeout: Optional request timeout in seconds.
     """
-    if token is None:
-        return None
-    stripped = token.strip()
-    return stripped or None
 
+    base_url: str
+    use_sse: bool = False
+    auth_token: Optional[str] = None
+    origin: Optional[str] = None
+    timeout: Optional[float] = None
 
-def create_panda_mcp_client(
-    host: str,
-    port: int,
-    *,
-    transport: str,
-    use_http: bool,
-    token: Optional[str],
-    vo: Optional[str],
-) -> Client:
-    """Create a configured PanDA MCP :class:`fastmcp.Client`.
+    @classmethod
+    def from_env(cls) -> "PanDAMCPConfig":
+        """Build configuration from environment variables.
 
-    This mirrors the behavior of the original MCP test client:
+        The method first checks PANDA_MCP_BASE_URL. If it is not set,
+        it falls back to the legacy host/port/path variables.
 
-    Example (original):
+        Returns:
+            PanDAMCPConfig: Parsed configuration.
 
-        if args.use_http:
-            base_url = f"http://{args.host}:{args.port}/mcp/"
-        else:
-            base_url = f"https://{args.host}:{args.port}/mcp/"
+        Raises:
+            ValueError: If neither PANDA_MCP_BASE_URL nor PANDA_MCP_HOST
+                is set in the environment.
+        """
+        # 1) Try new-style base URL.
+        base_url = os.environ.get("PANDA_MCP_BASE_URL")
 
-        headers = {"Origin": args.vo} if args.token else None
+        # 2) If not provided, build from legacy host/port/path.
+        if not base_url:
+            host = os.environ.get("PANDA_MCP_HOST")
+            if not host:
+                raise ValueError(
+                    "PANDA_MCP_BASE_URL is not set and PANDA_MCP_HOST is not set. "
+                    "Cannot construct PanDA MCP endpoint URL."
+                )
 
-        if args.transport == "streamable-http":
-            transport = StreamableHttpTransport(
-                url=base_url, auth=args.token, headers=headers
-            )
-        else:
-            transport = SSETransport(url=base_url, auth=args.token, headers=headers)
+            port = os.environ.get("PANDA_MCP_PORT", "25080")
+            path = os.environ.get("PANDA_MCP_PATH", "/mcp/")
 
-    Args:
-        host: Hostname of the PanDA MCP server.
-        port: Port of the PanDA MCP server.
-        transport: Transport type, either ``"streamable-http"`` or ``"sse"``.
-        use_http: Whether to use HTTP (``True``) or HTTPS (``False``).
-        token: Authentication token passed as ``auth`` to the transport.
-        vo: Virtual organization string, used to set the ``Origin`` header.
-            Only used if ``token`` is provided.
+            # Decide scheme: if PANDA_MCP_USE_HTTP is explicitly "false",
+            # assume https; otherwise default to http for backward compatibility.
+            use_http_flag = os.environ.get("PANDA_MCP_USE_HTTP", "").lower()
+            if use_http_flag == "false":
+                scheme = "https"
+            else:
+                scheme = "http"
 
-    Returns:
-        A configured :class:`fastmcp.Client` instance.
-    """
-    """Create a configured PanDA MCP :class:`fastmcp.Client`."""
+            # Ensure path starts and ends sensibly
+            if not path.startswith("/"):
+                path = "/" + path
+            # FastMCP HTTP transport is fine whether or not we end with '/'
+            base_url = f"{scheme}://{host}:{port}{path}"
 
-    # IMPORTANT: make empty strings behave like no token at all
-    token = _normalize_token(token)
+        # 3) Common options.
+        use_sse = os.environ.get("PANDA_MCP_USE_SSE", "").lower() in {"1", "true", "yes"}
+        auth_token = os.environ.get("PANDA_MCP_TOKEN") or None
+        origin = os.environ.get("PANDA_MCP_ORIGIN") or None
+        timeout_str = os.environ.get("PANDA_MCP_TIMEOUT")
+        timeout = float(timeout_str) if timeout_str else None
 
-    if use_http:
-        base_url = f"http://{host}:{port}/mcp/"
-    else:
-        base_url = f"https://{host}:{port}/mcp/"
-
-    headers: Optional[Dict[str, str]] = {"Origin": vo} if token and vo else None
-
-    if transport == "streamable-http":
-        t = StreamableHttpTransport(url=base_url, auth=token, headers=headers)
-    elif transport == "sse":
-        t = SSETransport(url=base_url, auth=token, headers=headers)
-    else:
-        raise ValueError(f"Unsupported transport: {transport!r}")
-
-    return Client(transport=t)
-
-# ---------------------------------------------------------------------------
-# High-level wrapper for Ask PanDA integration
-# ---------------------------------------------------------------------------
+        return cls(
+            base_url=base_url,
+            use_sse=use_sse,
+            auth_token=auth_token,
+            origin=origin,
+            timeout=timeout,
+        )
 
 
 class PanDAMCPClient:
-    """High-level client wrapper for the PanDA MCP server.
+    """
+    Generic client for the PanDA MCP server.
 
-    This wraps the configuration needed to talk to the PanDA MCP server and
-    uses :func:`create_panda_mcp_client` internally for each operation.
+    This is a thin wrapper around fastmcp.Client that focuses on:
+    - tool discovery
+    - generic tool invocation
 
-    For health checks, it deliberately recreates a fresh low-level client and
-    uses the same pattern as the working test script:
+    It deliberately avoids defining one method per tool. Instead, Ask PanDA
+    agents (or an LLM) should:
+        - inspect available tools via `list_tools()`
+        - select the appropriate tool using the descriptions & schemas
+        - call the tool via `call_tool(name, arguments)`
 
-        client = create_panda_mcp_client(...)
-        async with client:
-            await client.call_tool("is_alive", {})
+    Example:
+        async with PanDAMCPClient.from_env() as client:
+            # Discover tools
+            tools = client.list_tools()
+            for tool in tools:
+                print(tool.name, tool.description)
 
-    This avoids subtle context-manager / reuse issues and ensures
-    "Is the server alive?" style prompts follow the known-good code path.
+            # Call the "is_alive" tool
+            result = await client.call_tool("is_alive", {})
+            print("Server says:", result)
     """
 
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        *,
-        transport: str,
-        use_http: bool,
-        token: Optional[str],
-        vo: Optional[str],
-    ) -> None:
-        """Initialize a :class:`PanDAMCPClient` instance.
+    def __init__(self, config: PanDAMCPConfig):
+        self._config = config
+        self._client: Optional[MCPClient] = None
 
-        Args:
-            host: Hostname of the PanDA MCP server.
-            port: Port of the PanDA MCP server.
-            transport: Transport type, either ``"streamable-http"`` or ``"sse"``.
-            use_http: Whether to use HTTP (``True``) or HTTPS (``False``).
-            token: Authentication token passed as ``auth`` to the transport.
-            vo: Virtual organization string, used to set the ``Origin`` header.
+    # ------------------------------------------------------------------
+    # Construction / context management
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_env(cls) -> "PanDAMCPClient":
         """
-        # Store config so we can recreate a low-level client whenever needed.
-        self._host: str = host
-        self._port: int = port
-        self._transport: str = transport
-        self._use_http: bool = use_http
-        self._token: Optional[str] = token
-        self._vo: Optional[str] = vo
-
-        # Underlying client (used for generic calls if needed)
-        self._client: Client = create_panda_mcp_client(
-            host=host,
-            port=port,
-            transport=transport,
-            use_http=use_http,
-            token=token,
-            vo=vo,
-        )
+        Create a client using environment variables via PanDAMCPConfig.from_env().
+        """
+        config = PanDAMCPConfig.from_env()
+        return cls(config)
 
     async def __aenter__(self) -> "PanDAMCPClient":
-        """Enter the asynchronous context manager.
-
-        Returns:
-            The connected :class:`PanDAMCPClient` instance.
-        """
-        await self._client.connect()
+        await self.connect()
         return self
 
-    async def __aexit__(
-        self,
-        exc_type: Optional[type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[Any],
-    ) -> None:
-        """Exit the asynchronous context manager.
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
 
-        Args:
-            exc_type: Exception type, if any.
-            exc: Exception instance, if any.
-            tb: Traceback object, if any.
+    async def connect(self) -> None:
         """
-        del exc_type, exc, tb  # unused
-        await self._client.disconnect()
+        Initialize the underlying fastmcp.Client and connect to the server.
 
-    @property
-    def is_connected(self) -> bool:
-        """bool: Whether the underlying client is currently connected."""
-        return self._client.is_connected()
-
-    async def list_tools(self) -> Sequence[Any]:
-        """List tools exposed by the PanDA MCP server.
-
-        Returns:
-            A sequence of tool descriptors.
+        Normally you use this via `async with PanDAMCPClient(...)` so you
+        rarely need to call `connect()` explicitly.
         """
-        return await self._client.list_tools()
+        if self._client is not None:
+            return  # already connected
 
-    async def call_tool(
-        self,
-        tool_name: str,
-        arguments: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """Call a specific MCP tool on the PanDA MCP server.
+        headers: Dict[str, str] = {}
+        if self._config.auth_token:
+            headers["Authorization"] = f"Bearer {self._config.auth_token}"
+        if self._config.origin:
+            headers["Origin"] = self._config.origin
 
-        Args:
-            tool_name: Name of the tool to invoke.
-            arguments: Dictionary of arguments for the tool. If ``None``,
-                an empty dictionary is used.
-
-        Returns:
-            Tool result payload as returned by the server.
-        """
-        return await self._client.call_tool(tool_name, arguments or {})
-
-    async def is_server_running(self) -> bool:
-        """Check whether the PanDA MCP server is reachable and responsive.
-
-        Strategy:
-            * Create a fresh :class:`fastmcp.Client` using the same
-              configuration as the working test script.
-            * Connect with ``async with client``.
-            * Call the ``"is_alive"`` tool.
-            * If that call succeeds without raising, consider the server
-              "running".
-
-        Returns:
-            True if the server appears to be running and responsive,
-            otherwise False.
-        """
-        try:
-            client: Client = create_panda_mcp_client(
-                host=self._host,
-                port=self._port,
-                transport=self._transport,
-                use_http=self._use_http,
-                token=self._token,
-                vo=self._vo,
+        if self._config.use_sse:
+            transport = SSETransport(
+                url=self._config.base_url,
+                headers=headers or None,
             )
-            async with client:
-                await client.call_tool("is_alive", {})
-            return True
-        except Exception:
-            return False
-
-    async def answer_prompt(self, prompt: str) -> str:
-        """Answer a natural-language prompt using simple pattern routing.
-
-        Currently supports questions about PanDA MCP server status, e.g.:
-
-            "Is the server alive?"
-            "Is the panda server alive?"
-            "Is the PanDA server running?"
-            "What is the PanDA MCP status?"
-
-        Args:
-            prompt: Natural-language input question.
-
-        Returns:
-            A human-readable answer string describing the server status or
-            indicating that the prompt is not handled.
-        """
-        normalized = prompt.strip().lower()
-
-        # Explicit phrases we care about
-        server_keywords = (
-            "is the panda server running",
-            "is panda server running",
-            "status of the panda server",
-            "panda mcp status",
-            "panda mcp server",
-            "panda mcp health",
-        )
-
-        # Match explicit keywords OR generic "server + alive" pattern
-        is_explicit = any(keyword in normalized for keyword in server_keywords)
-        is_server_alive_like = ("server" in normalized and "alive" in normalized)
-
-        if is_explicit or is_server_alive_like:
-            running = await self.is_server_running()
-            if running:
-                return (
-                    "Yes, the PanDA MCP server appears to be running and "
-                    "responsive."
-                )
-            return (
-                "No, the PanDA MCP server does not appear to be reachable or "
-                "responsive right now."
-            )
-
-        return (
-            "PanDAMCPClient received a prompt it does not currently handle: "
-            f"{prompt!r}. Consider adding a dedicated handler for this case."
-        )
-
-    def answer_prompt_sync(self, prompt: str) -> str:
-        """Synchronously answer a natural-language prompt.
-
-        Args:
-            prompt: Natural-language input question.
-
-        Returns:
-            A human-readable answer string.
-        """
-        return asyncio.run(self.answer_prompt(prompt))
-
-    def is_server_running_sync(self) -> bool:
-        """Synchronously check whether the PanDA MCP server is running.
-
-        Returns:
-            True if the server appears to be running and responsive,
-            otherwise False.
-        """
-        return asyncio.run(self.is_server_running())
-
-# ---------------------------------------------------------------------------
-# CLI / test harness
-# ---------------------------------------------------------------------------
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the argument parser for the CLI interface.
-
-    Returns:
-        Configured :class:`argparse.ArgumentParser` instance.
-    """
-    parser = argparse.ArgumentParser(description="PanDA MCP client")
-
-    parser.add_argument(
-        "--host",
-        default="localhost",
-        type=str,
-        help="PanDA MCP server host.",
-    )
-    parser.add_argument(
-        "--port",
-        default=8000,
-        type=int,
-        help="PanDA MCP server port.",
-    )
-    parser.add_argument(
-        "--use-http",
-        action="store_true",
-        help="Use HTTP instead of HTTPS (default is HTTPS if not set).",
-    )
-    parser.add_argument(
-        "--transport",
-        default="streamable-http",
-        choices=["streamable-http", "sse"],
-        help="MCP transport type.",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        type=str,
-        help="Authentication token for the MCP server.",
-    )
-    parser.add_argument(
-        "--vo",
-        default=None,
-        type=str,
-        help="VO string used for Origin header (required by some servers).",
-    )
-
-    parser.add_argument(
-        "--tool",
-        default=None,
-        type=str,
-        help="Optional: name of a specific MCP tool to test (e.g. 'panda_health').",
-    )
-    parser.add_argument(
-        "--kv",
-        nargs="*",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Optional: key=value pairs for the tool arguments.",
-    )
-
-    parser.add_argument(
-        "--question",
-        default=None,
-        type=str,
-        help="Natural-language question to send via PanDAMCPClient.answer_prompt.",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        type=str,
-        help="Unused here, but kept for compatibility with other clients.",
-    )
-
-    return parser
-
-
-def parse_kv_pairs(pairs: Sequence[str]) -> Dict[str, Any]:
-    """Parse key=value pairs from the CLI into a dictionary.
-
-    Args:
-        pairs: Sequence of strings in the form ``KEY=VALUE``.
-
-    Returns:
-        Dictionary mapping keys to values (all values are strings).
-    """
-    result: Dict[str, Any] = {}
-    for item in pairs:
-        if "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        result[key] = value
-    return result
-
-
-async def cl(args: argparse.Namespace) -> None:
-    """Main async entry point for the CLI.
-
-    Behavior:
-
-    * If ``--question`` is provided, use :class:`PanDAMCPClient` to
-      answer a natural-language prompt (e.g. "Is the server alive?").
-    * Otherwise, use the low-level :class:`fastmcp.Client` to:
-        - connect,
-        - list tools,
-        - optionally call a specific tool if ``--tool`` is provided.
-
-    Args:
-        args: Parsed command-line arguments.
-    """
-    # First, handle the high-level question path (PanDAMCPClient wrapper).
-    if args.question:
-        wrapper = PanDAMCPClient(
-            host=args.host,
-            port=args.port,
-            transport=args.transport,
-            use_http=args.use_http,
-            token=args.token,
-            vo=args.vo,
-        )
-        answer = await wrapper.answer_prompt(args.question)
-        print(answer)
-        return
-
-    # Otherwise, run in "raw test" mode with a direct fastmcp.Client.
-    client: Client = create_panda_mcp_client(
-        host=args.host,
-        port=args.port,
-        transport=args.transport,
-        use_http=args.use_http,
-        token=args.token,
-        vo=args.vo,
-    )
-
-    async with client:
-        if client.is_connected():
-            print("Client connected")
         else:
-            print("Client failed to connect")
+            transport = StreamableHttpTransport(
+                url=self._config.base_url,
+                headers=headers or None,
+            )
+
+        self._client = MCPClient(
+            name="ask-panda-mcp-client",
+            transport=transport,
+        )
+
+        # Establish connection; handle different fastmcp versions.
+        # Newer versions may expose `connect()`, older ones only `_connect`.
+        if hasattr(self._client, "connect"):
+            await self._client.connect()  # type: ignore[func-returns-value]
+        elif hasattr(self._client, "_connect"):
+            await self._client._connect()  # type: ignore[attr-defined]
+        else:
+            # Fallback: some fastmcp versions lazily connect on first use.
+            # In that case, nothing to do here.
+            pass
+
+    async def close(self) -> None:
+        """Close the underlying connection to the MCP server.
+
+        This method handles different fastmcp versions:
+
+        - Newer versions may expose an async ``aclose()`` method.
+        - Older versions may only expose ``close()``.
+        """
+        if self._client is None:
             return
 
-        tools = await client.list_tools()
-        print("\nAvailable tools:")
-        for tool in tools:
-            name = getattr(tool, "name", "<unknown>")
-            description = getattr(tool, "description", "")
-            print(f"- {name} -")
-            if description:
-                print(f"  Description: {description}")
-            print()
+        # Newer fastmcp versions
+        if hasattr(self._client, "aclose"):
+            await self._client.aclose()  # type: ignore[func-returns-value]
+        # Older fastmcp versions
+        elif hasattr(self._client, "close"):
+            await self._client.close()  # type: ignore[func-returns-value]
 
-        if args.tool:
-            kv_args = parse_kv_pairs(args.kv)
-            print("\n" * 2)
-            print(f"Testing tool {args.tool!r} with args {kv_args!r}:")
-            result = await client.call_tool(args.tool, kv_args)
-            print(f"Result: {result}\n")
+        self._client = None
 
-    if not client.is_connected():
-        print("Client disconnected")
-    else:
-        print("Client still connected")
-    print("Done")
+    # ------------------------------------------------------------------
+    # Tool discovery
+    # ------------------------------------------------------------------
+    def _require_client(self) -> MCPClient:
+        if self._client is None:
+            raise RuntimeError(
+                "PanDAMCPClient is not connected. "
+                "Use `async with PanDAMCPClient(...)` or await `.connect()` first."
+            )
+        return self._client
 
+    async def list_tools(self) -> List[Any]:
+        """Return the list of tools exposed by the PanDA MCP server.
 
-def main() -> None:
-    """Entry point for ``python -m clients.panda_mcp``."""
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    asyncio.run(cl(args))
+        This method supports different fastmcp versions:
 
+        - Some expose an async ``list_tools()`` method.
+        - Others may expose a ``tools`` attribute (mapping or iterable).
 
-if __name__ == "__main__":
-    main()
+        Returns:
+            List of tool objects as returned by fastmcp.
+        """
+        client = self._require_client()
+
+        # Preferred: async list_tools() method.
+        if hasattr(client, "list_tools"):
+            # Older or alternate fastmcp versions: list_tools() is async.
+            tools = await client.list_tools()  # type: ignore[func-returns-value]
+            return list(tools)
+
+        # Fallback: tools attribute (if present in some versions).
+        if hasattr(client, "tools"):
+            tools_attr = getattr(client, "tools")
+            if isinstance(tools_attr, Mapping):
+                return list(tools_attr.values())
+            return list(tools_attr)  # type: ignore[arg-type]
+
+        # Last resort: no tool info available.
+        return []
+
+    def get_tool(self, name: str) -> Optional[Any]:
+        """
+        Retrieve a single tool by name, or None if no such tool exists.
+        """
+        client = self._require_client()
+        if isinstance(client.tools, Mapping):
+            return client.tools.get(name)
+        # Fallback if tools is some other iterable type
+        for tool in client.tools:
+            if tool.name == name:
+                return tool
+        return None
+
+    async def describe_tools_for_llm(self) -> str:
+        """Return a human-readable description of all tools for LLM context.
+
+        The returned string includes tool names, descriptions, and JSON schemas
+        for their parameters. It is intended to be passed as context to an LLM
+        so that it can decide which tool to use and how to construct arguments.
+
+        Returns:
+            Multi-line string describing all known tools.
+        """
+        tools = await self.list_tools()
+        blocks: List[str] = []
+
+        for t in tools:
+            # Try to access name/description/input_schema in a robust way.
+            name = getattr(t, "name", "<unknown>")
+            description = getattr(t, "description", "") or "(no description)"
+            schema = getattr(t, "input_schema", None)
+
+            try:
+                if hasattr(schema, "model_json_schema"):
+                    schema_dict = schema.model_json_schema()
+                elif hasattr(schema, "schema"):
+                    schema_dict = schema.schema()
+                else:
+                    schema_dict = schema if schema is not None else {}
+                schema_json = json.dumps(schema_dict, indent=2, sort_keys=True)
+            except Exception:
+                schema_json = "<unable to serialize schema>"
+
+            block = (
+                f"Tool name: {name}\n"
+                f"Description:\n{description}\n"
+                f"Parameters (JSON Schema):\n{schema_json}\n"
+                "----"
+            )
+            blocks.append(block)
+
+        return "\n\n".join(blocks)
+
+    # ------------------------------------------------------------------
+    # Tool invocation
+    # ------------------------------------------------------------------
+    async def call_tool(
+            self,
+            tool_name: str,
+            arguments: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Call a specific PanDA MCP tool with the given arguments.
+
+        Args:
+            tool_name: Name of the tool to call (as advertised by MCP).
+            arguments: Dict of arguments matching the tool's JSON schema.
+
+        Returns:
+            The tool's result in a convenient Python form:
+
+            - If fastmcp returns a CallToolResult, this method preferentially
+              returns its ``structured_content`` or ``data`` field (e.g., a dict).
+            - Otherwise, it returns the raw result as-is.
+
+        Raises:
+            RuntimeError: If the client is not connected.
+            Any underlying exception thrown by ``fastmcp.Client.call_tool()``.
+        """
+        client = self._require_client()
+        result = await client.call_tool(tool_name, arguments or {})
+
+        # fastmcp typically returns a CallToolResult object with several fields:
+        #   - content (list of content blocks)
+        #   - structured_content (dict/list/str)
+        #   - data (dict/list/str)
+        #   - is_error (bool)
+        #
+        # For Ask PanDA, we want the most structured representation.
+        structured = getattr(result, "structured_content", None)
+        if structured is not None:
+            return structured
+
+        data = getattr(result, "data", None)
+        if data is not None:
+            return data
+
+        # Fallback: if a single text content exists, try to return that.
+        content = getattr(result, "content", None)
+        if isinstance(content, list) and content:
+            first = content[0]
+            text = getattr(first, "text", None)
+            if isinstance(text, str):
+                return text
+
+        # Last resort: return the raw result.
+        return result
+
+    # ------------------------------------------------------------------
+    # Optional helpers (non-essential; do *not* rely on hardcoded tools)
+    # ------------------------------------------------------------------
+    async def ping_any_health_tool(self) -> bool:
+        """
+        Optional helper: try to call a "health"/"is_alive" type tool if present.
+
+        This method does *not* assume a fixed tool name, but tries a few
+        conventional candidates. If none exist, it returns False.
+
+        This is purely a convenience for quick health checks and not intended
+        for core logic.
+        """
+        candidates = ["is_alive", "health", "ping"]
+        tools_by_name = {t.name: t for t in self.list_tools()}
+
+        for name in candidates:
+            if name in tools_by_name:
+                try:
+                    result = await self.call_tool(name, {})
+                    print(result)
+                    # Interpret any successful call as "alive"
+                    return True
+                except Exception:
+                    return False
+
+        # No candidate tool found
+        return False

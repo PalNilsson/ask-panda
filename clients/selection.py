@@ -17,456 +17,579 @@
 # Authors:
 # - Paul Nilsson, paul.nilsson@cern.ch, 2025
 
-from logging_config import setup_logging
-setup_logging("selection")
-import logging
-logger = logging.getLogger(__name__)
+"""Selection agent for Ask PanDA.
+
+This module implements a SelectionAgent that:
+- Classifies incoming questions into high-level categories (document, task, log analysis, etc.).
+- Routes questions to the appropriate client/agent.
+- Integrates with a generic PanDA MCP client (PanDAMCPClient) that discovers tools dynamically.
+
+The key design goal is to avoid hardcoding any MCP tool names in the client/agent code.
+Instead, the PanDA MCP server exposes tools and their docstrings via MCP; the LLM uses
+that metadata to decide which tool to call and with what arguments.
+"""
+
+from __future__ import annotations
 
 import argparse
+import asyncio
+import json
+import logging
 import os
-import re
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
+
 import requests
-import sys
-from json import JSONDecodeError
-from time import sleep
 
 from clients.document_query import DocumentQuery
 from clients.log_analysis import LogAnalysis
 from clients.data_query import TaskStatus
 from clients.panda_mcp import PanDAMCPClient
-from tools.context_memory import ContextMemory
-from tools.errorcodes import EC_TIMEOUT
-from tools.server_utils import ASK_PANDA_BASE_URL, check_server_health
 
-memory = ContextMemory()
+# ---------------------------------------------------------------------------
+# Module-level logger and defaults
+# ---------------------------------------------------------------------------
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=os.getenv("ASK_PANDA_LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+)
+
+ASK_PANDA_BASE_URL = os.getenv("ASK_PANDA_BASE_URL", "http://127.0.0.1:8000")
+
+
+# ---------------------------------------------------------------------------
+# Utility: Client bundle
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClientBundle:
+    """Container for all Ask PanDA clients.
+
+    Attributes:
+        document: Client for static documentation / RAG.
+        queue: Placeholder for future queue client.
+        task: Client for task status queries.
+        log_analyzer: Client for log analysis.
+        pilot_activity: Placeholder for pilot monitoring client.
+        panda_mcp: Generic PanDA MCP client.
+    """
+
+    document: Optional[DocumentQuery]
+    queue: Optional[Any]
+    task: Optional[TaskStatus]
+    log_analyzer: Optional[LogAnalysis]
+    pilot_activity: Optional[Any]
+    panda_mcp: Optional[PanDAMCPClient]
+
+
+def get_clients(
+    model: str,
+    session_id: Optional[str],
+    pandaid: Optional[str],
+    taskid: Optional[str],
+    cache: str,
+) -> ClientBundle:
+    """Create and return a bundle of clients for the different categories.
+
+    Args:
+        model: LLM model identifier.
+        session_id: Optional session ID for conversation context.
+        pandaid: Optional PanDA job ID for log analysis.
+        taskid: Optional PanDA task ID for task status.
+        cache: Path or key for cache storage.
+
+    Returns:
+        ClientBundle: Container object with initialized clients.
+    """
+    document_client = DocumentQuery(model, session_id)
+    queue_client = None  # Placeholder for future queue client.
+
+    task_client = TaskStatus(model, taskid, cache, session_id) if session_id and taskid else None
+    log_client = LogAnalysis(model, pandaid, cache, session_id) if pandaid else None
+    pilot_client = None  # Placeholder for a future PilotMonitorAgent, etc.
+
+    # Generic MCP client using environment variables (PANDA_MCP_BASE_URL, etc.)
+    panda_mcp: Optional[PanDAMCPClient]
+    try:
+        panda_mcp = PanDAMCPClient.from_env()
+    except ValueError as exc:
+        logger.warning("PanDA MCP client not configured: %s", exc)
+        panda_mcp = None
+
+    return ClientBundle(
+        document=document_client,
+        queue=queue_client,
+        task=task_client,
+        log_analyzer=log_client,
+        pilot_activity=pilot_client,
+        panda_mcp=panda_mcp,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Selection agent
+# ---------------------------------------------------------------------------
 
 class Selection:
-    def __init__(self, clients: dict, model: str, session_id: str = None) -> None:
-        self.clients = clients  # dict like {"document": ..., "queue": ...}
-        self.model = model        # e.g., OpenAI or Anthropic wrapper
-        self.session_id = session_id  # Session ID for tracking conversation
+    """Selection agent to route questions to appropriate Ask PanDA clients.
 
-    def classify_question(self, question: str) -> str:
-        """
-        Classify the question into one of the predefined categories.
+    The Selection agent has two main responsibilities:
 
-        This is where the rules are defined to classify the question to
-        be able to select the appropriate client.
+    1. Classify an incoming natural-language question into a high-level category
+       (e.g., "document", "task", "log_analyzer", "panda_mcp").
+    2. Based on the category, forward the question to the appropriate client and
+       return the resulting answer.
+
+    For the PanDA MCP category, the Selection agent uses a generic PanDAMCPClient
+    that discovers tools dynamically from the MCP server. It does not hardcode
+    any specific tool names. Instead, it queries the MCP server for tool metadata
+    and uses an LLM to choose which tool to call and with which arguments.
+    """
+
+    def __init__(
+        self,
+        clients: ClientBundle,
+        model: str,
+        session_id: Optional[str],
+    ) -> None:
+        """Initialize a Selection instance.
 
         Args:
-            question (str): The question to classify.
-
-        Returns:
-            str: The category of the question (e.g., "document", "queue", "task", "log_analyzer", "pilot_activity").
+            clients: A bundle of Ask PanDA clients for different categories.
+            model: LLM model identifier to use when calling the Ask PanDA server.
+            session_id: Optional session ID for conversation context.
         """
-        # no need to involve the LLM if we can classify it with simple rules
-        initial = self.simple_classification(question)
-        logger.info(f"Initial classification: {initial}")
-        if initial != "undefined":
-            return initial
+        self.clients = clients
+        self.model = model
+        self.session_id = session_id
 
-        prompt = f"""
-You are a routing assistant for a question-answering system. Your job is to classify a question into one of the following categories, based on its topic:
-
-- document:
-    Questions about general usage, concepts, how-to guides, or error messages that are answered from documentation
-    or long-form knowledge of systems (e.g. PanDA, prun, pathena, containers, error codes).
-- queue:
-    Questions about site or queue data stored in a JSON file (e.g. queues at a site, corepower, copytool, status of a queue, which queues use rucio).
-- log_analyzer:
-    Questions about why a specific job failed (e.g. log or failure analysis of job NNN).
-    The word 'job', 'pandaid' or 'panda id' must be followed by a number.
-    If the last line in the question is a number and the user provides no other hint, you should assume it is a job id and select the 'job' category.
-- task:
-    Questions about a specific task's status or job counts (e.g. status of task NNN, number of failed jobs).
-    The word 'task' or 'task id' or 'taskid' must be followed by a number.
-    If the last line in the question is a number and the user provides no other hint, you should assume it is a task id and select the 'task' category.
-- pilot_activity: Questions about pilot activity, failures, or statistics, possibly using information from Grafana
-    (e.g. pilots running on queue X, pilots failing, links to Grafana).
-- panda_mcp:
-    Questions about whether the PanDA MCP server is alive, reachable or running
-    (e.g. "Is the server alive?", "Is the PanDA server running?", "PanDA MCP status").
-
-Classify the following question:
-
-"{question}"
-
-Output only one of the categories: document, queue, log_analyzer, task, pilot_activity, or panda_mcp.
-"""
-        result = self.ask(prompt, returnstring=True).strip().lower()
-        return result if result in self.clients else "document"
-
-    import re
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
 
     def simple_classification(self, question: str) -> str:
-        """
-        A simple rule-based classification of the question into categories.
+        """Classify the question into a category using heuristic rules.
+
+        This is a lightweight, heuristic-based classifier. It can be replaced
+        or augmented by an LLM-based classifier if needed.
 
         Args:
-            question (str): The question to classify.
+            question: Natural-language question from the user.
 
         Returns:
-            str: The category of the question ("document", "task", "log_analyzer", "panda_mcp", or "undefined").
+            Category string, one of:
+            - "document"
+            - "queue"
+            - "task"
+            - "log_analyzer"
+            - "pilot_activity"
+            - "panda_mcp"
+            - "undefined"
         """
-        # Normalize text (case-insensitive matching)
-        q = question.lower()
+        q_lower = question.lower()
 
-        # Quick detection of PanDA MCP / server-status questions
-        panda_mcp_keywords = (
-            "panda mcp",
-            "panda mcp status",
-            "panda mcp server",
-            "panda server status",
-            "is the server alive",
-            "is the panda server running",
-            "is panda server running",
-        )
-        if any(keyword in q for keyword in panda_mcp_keywords):
+        # 1) Explicit MCP mentions always go to panda_mcp.
+        if "panda mcp" in q_lower or "mcp" in q_lower:
             return "panda_mcp"
 
-        # Regex patterns for task and job with numbers
-        task_pattern = r'\b(task|task id|taskid)\s*\d+'
-        job_pattern = r'\b(job|job id|jobid|panda id|pandaid)\s*\d+'
+        # 2) Health / status questions about the PanDA server.
+        health_words = ("alive", "health", "status", "up", "reachable", "responsive")
+        if "panda" in q_lower and any(w in q_lower for w in health_words):
+            # Examples:
+            #   "Is the panda server alive?"
+            #   "Is panda up?"
+            #   "Check the status of the panda server"
+            return "panda_mcp"
 
-        # Check for 'task' conditions
-        if re.search(task_pattern, q):
-            return "task"
-
-        # Check for 'job' conditions
-        if re.search(job_pattern, q):
+        # 3) Log analysis.
+        if any(word in q_lower for word in ("log", "stderr", "stdout", "stack trace", "traceback")):
             return "log_analyzer"
 
-        # If not matched, check for both 'task' and 'job' words (not necessarily with numbers)
-        if "task" in q or "job" in q:
-            # if the last line is a "User: " followed by a number we cannot classify it here
-            lines = q.strip().splitlines()
-            if lines and re.match(r'^user:\s*\d+$', lines[-1].strip()):
-                return "undefined"
+        # 4) Task-related.
+        if "task" in q_lower or "tasks" in q_lower:
+            return "task"
 
+        # 5) Queue / site-related.
+        if "queue" in q_lower or "site" in q_lower:
+            return "queue"
+
+        # 6) Pilot activity.
+        if "pilot" in q_lower:
+            return "pilot_activity"
+
+        # 7) Generic PanDA / ATLAS / documentation questions.
+        if any(word in q_lower for word in ("atlas", "panda", "documentation", "manual", "how does")):
             return "document"
 
-        # Default case
+        # 8) Fallback.
         return "undefined"
 
-    def answer(self, question: str) -> str:
-        return self.classify_question(question)
+    # ------------------------------------------------------------------
+    # Main ask / routing
+    # ------------------------------------------------------------------
 
-    def ask(self, question: str, returnstring=False) -> str or dict:
-        """
-        Send a question to the LLM via the MCP server and retrieve the answer.
-
-        This function sends the question and the selected model to the
-        ASK_PANDA_BASE_URL server endpoint using a POST request. It expects a
-        JSON response containing the answer. If the response indicates an error
-        (with a non-200 status code), an error message is returned instead.
+    def ask(self, question: str) -> str:
+        """Answer a user question by routing it to the appropriate client.
 
         Args:
-            question (str): The question to ask the LLM.
+            question: Natural-language question from the user.
 
         Returns:
-            str or dict: The answer from the LLM, or a dictionary containing the session ID, if
-            returnstring is False. If returnstring is True, returns the answer as a string.
+            Answer as a string. If routing or downstream processing fails,
+            an error message is returned instead.
         """
-        server_url = os.getenv("ASK_PANDA_BASE_URL", f"{ASK_PANDA_BASE_URL}/rag_ask")
+        category = self.simple_classification(question)
+        logger.info("Initial classification: %s", category)
 
-        # Construct prompt
-        prompt = question
+        if category == "document" and self.clients.document:
+            logger.info("Routing question to DocumentQuery client")
+            return self.clients.document.ask(question)
 
-        try:
-            response = requests.post(server_url, json={"question": prompt, "model": self.model}, timeout=30)
-            if response.ok:
+        if category == "task" and self.clients.task:
+            logger.info("Routing question to TaskStatus client")
+            return self.clients.task.ask(question)
+
+        if category == "log_analyzer" and self.clients.log_analyzer:
+            logger.info("Routing question to LogAnalysis client")
+            return self.clients.log_analyzer.ask(question)
+
+        if category == "pilot_activity" and self.clients.pilot_activity:
+            logger.info("Routing question to PilotMonitor client")
+            return self.clients.pilot_activity.ask(question)
+
+        if category == "panda_mcp" and self.clients.panda_mcp:
+            logger.info("Routing question to PanDAMCPClient with MCP-based tool selection")
+            return self._route_panda_mcp_question(question, self.clients.panda_mcp)
+
+        # Fallback: treat as a document / RAG question if possible.
+        if self.clients.document:
+            logger.info(
+                "Category '%s' is undefined or missing client. "
+                "Falling back to DocumentQuery.",
+                category,
+            )
+            return self.clients.document.ask(question)
+
+        return (
+            "Error: Unable to route the question due to missing clients. "
+            "Please check the Ask PanDA server configuration."
+        )
+
+    def _format_mcp_result(self, tool_name: str, result: Any) -> str:
+        """Format a PanDA MCP tool result into a user-friendly string.
+
+        This method adds a small UX layer on top of the raw JSON returned by
+        MCP tools. It is intentionally conservative: if it does not recognize
+        the structure, it falls back to pretty-printed JSON or a string
+        representation.
+
+        Args:
+            tool_name: Name of the MCP tool that was called.
+            result: Raw result returned from ``PanDAMCPClient.call_tool()``.
+
+        Returns:
+            Human-readable string representation of the result.
+        """
+        # Common PanDA pattern: {"success": bool, "message": str, "data": ...}
+        if isinstance(result, dict):
+            success = result.get("success")
+            message = result.get("message")
+            data = result.get("data")
+
+            # Special-case health-style tools like is_alive
+            if tool_name == "is_alive" and isinstance(success, bool):
+                if success:
+                    return "PanDA MCP reports: the service is **alive** and reachable."
+                return "PanDA MCP reports: the service is **not** alive or returned an error."
+
+            # Generic handling for this common shape
+            if isinstance(success, bool) and ("message" in result or "data" in result):
+                status = "succeeded" if success else "failed"
+                parts = [f"PanDA MCP tool '{tool_name}' {status}."]
+                if isinstance(message, str) and message.strip():
+                    parts.append(f"Message: {message.strip()}")
+                # If data is non-trivial, append a JSON dump
+                if data not in (None, "", [], {}):
+                    try:
+                        data_json = json.dumps(data, indent=2, sort_keys=True)
+                        parts.append("Data:\n" + data_json)
+                    except Exception:  # noqa: BLE001
+                        parts.append(f"Data: {data!r}")
+                return "\n".join(parts)
+
+            # Fallback for arbitrary dicts: pretty-printed JSON
+            try:
+                return json.dumps(result, indent=2, sort_keys=True)
+            except Exception:  # noqa: BLE001
+                return str(result)
+
+        # List result: pretty-print JSON if possible
+        if isinstance(result, list):
+            try:
+                return json.dumps(result, indent=2, sort_keys=True)
+            except Exception:  # noqa: BLE001
+                return str(result)
+
+        # All other types: string representation
+        return str(result)
+
+    # ------------------------------------------------------------------
+    # PanDA MCP routing
+    # ------------------------------------------------------------------
+
+    def _route_panda_mcp_question(
+        self,
+        question: str,
+        client: PanDAMCPClient,
+    ) -> str:
+        """Route a PanDA MCP question via the generic PanDAMCPClient.
+
+        This routing method follows four steps:
+
+        1. Connect to the PanDA MCP server and obtain the list of tools,
+           including their descriptions and JSON schemas, using
+           ``client.describe_tools_for_llm()``.
+        2. Send a routing prompt to the Ask PanDA server, instructing the LLM
+           to choose a single tool and construct the arguments to call it.
+        3. Parse the LLM's JSON response to extract the tool name and arguments.
+        4. Call the chosen tool with ``client.call_tool(tool_name, arguments)``
+           and return the formatted result.
+
+        The design explicitly avoids hardcoding any tool names. The MCP server
+        is the source of truth for available tools, and the LLM uses the tool
+        metadata (names, docstrings, parameter schemas) to select the tool.
+
+        Args:
+            question: Natural-language user question about PanDA or its APIs.
+            client: Initialized PanDAMCPClient instance.
+
+        Returns:
+            Answer string derived from the MCP tool's result or an error message.
+        """
+
+        async def _inner() -> str:
+            """Async implementation of the MCP routing logic.
+
+            Returns:
+                Answer string or error message.
+            """
+            async with client:
+                tools_description = await client.describe_tools_for_llm()
+
+                router_prompt = f"""
+You are a routing assistant for the PanDA MCP (Model Context Protocol) server.
+
+You are given:
+- A list of available MCP tools, including their descriptions and JSON schemas.
+- A user question about PanDA, its APIs, or related operations.
+
+Your task is to:
+1. Carefully inspect the tools and their parameters.
+2. Decide which single tool is best suited to answer the user's question.
+3. Construct a valid JSON object of arguments for that tool, matching its JSON schema.
+
+Output format:
+Return ONLY a JSON object with exactly the following keys:
+
+{{
+  "tool_name": "<tool name as a string>",
+  "arguments": {{ ... JSON object of arguments ... }}
+}}
+
+Do NOT include any additional text or explanation.
+
+Tools and schemas:
+{tools_description}
+
+User question:
+{question}
+"""
+
+                server_url = os.getenv("ASK_PANDA_BASE_URL", f"{ASK_PANDA_BASE_URL}/rag_ask")
                 try:
-                    # Store interaction
-                    _answer = response.json()["answer"]
-                    if returnstring:
-                        return _answer
+                    response = requests.post(
+                        server_url,
+                        json={"question": router_prompt, "model": self.model},
+                        timeout=120,
+                    )
+                except requests.RequestException as exc:
+                    logger.error("Error contacting Ask PanDA server for MCP routing: %s", exc)
+                    return (
+                        "Error: could not contact the Ask PanDA server for MCP routing. "
+                        f"Details: {exc}"
+                    )
 
-                    answer = {
-                        "session_id": self.session_id,
-                        "question": question,
-                        "model": self.model,
-                        "answer": _answer
-                    }
-                    return answer
-                except JSONDecodeError:  # Changed to use imported JSONDecodeError
-                    return "Error: Could not decode JSON response from server."
-                except KeyError:
-                    return "Error: 'answer' key missing in server response."
-            else:
+                if not response.ok:
+                    logger.error(
+                        "Ask PanDA MCP router returned HTTP %s: %s",
+                        response.status_code,
+                        response.text,
+                    )
+                    return (
+                        "Error: Ask PanDA MCP router returned an HTTP error "
+                        f"{response.status_code}. Please try again later."
+                    )
+
+                # Some Ask PanDA deployments return {"answer": "..."} JSON; others
+                # may return plain text. Try both.
                 try:
-                    # Attempt to parse JSON for detailed error message
-                    error_data = response.json()
-                    if isinstance(error_data, dict) and "detail" in error_data:
-                        return f"Error from server: {error_data['detail']}"
-                    # Fallback if "detail" key is not found or JSON is not a dict
-                    return f"Error: Server returned status {response.status_code} - {response.text}"
-                except JSONDecodeError:  # Changed to use imported JSONDecodeError
-                    # Fall through to the generic error message if JSON parsing fails
-                    pass
-                # Fallback if JSON parsing fails or "detail" is not in a dict
-                return f"Error: Server returned status {response.status_code} - {response.text}"
-        except requests.exceptions.Timeout:
-            return f"Error: Request to {server_url} timed out."
-        except requests.exceptions.ConnectionError:
-            return f"Error: Failed to connect to {server_url}."
-        except Exception as e:
-            return f"Error: An unexpected error occurred: {str(e)}."
+                    payload = response.json()
+                    router_answer = payload.get("answer", payload)
+                except Exception:  # noqa: BLE001
+                    router_answer = response.text
+
+                if isinstance(router_answer, dict):
+                    routing_obj = router_answer
+                else:
+                    raw_text = str(router_answer).strip()
+
+                    # Many LLMs wrap JSON in ```json ... ``` fences. Strip them if present.
+                    if raw_text.startswith("```"):
+                        # Remove opening fence (``` or ```json)
+                        lines = raw_text.splitlines()
+                        if lines and lines[0].lstrip().startswith("```"):
+                            lines = lines[1:]
+                        # Remove closing fence if present
+                        if lines and lines[-1].strip().startswith("```"):
+                            lines = lines[:-1]
+                        raw_text = "\n".join(lines).strip()
+
+                    try:
+                        routing_obj = json.loads(raw_text)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "Failed to parse routing JSON from LLM: %s; content=%r",
+                            exc,
+                            router_answer,
+                        )
+                        return (
+                            "Error: could not interpret the PanDA MCP tool selection. "
+                            "Please refine your question or specify the API operation you need."
+                        )
+
+                if not isinstance(routing_obj, Mapping):
+                    logger.error("Routing output is not a JSON object: %r", routing_obj)
+                    return (
+                        "Error: unexpected format in PanDA MCP routing output. "
+                        "Please try rephrasing your question."
+                    )
+
+                tool_name = routing_obj.get("tool_name")
+                arguments = routing_obj.get("arguments", {})
+
+                if not isinstance(tool_name, str):
+                    logger.error("Routing result missing 'tool_name': %r", routing_obj)
+                    return (
+                        "Error: routing result did not specify a tool_name. "
+                        "Please refine your question."
+                    )
+
+                if not isinstance(arguments, dict):
+                    logger.error("Routing result 'arguments' is not a dict: %r", routing_obj)
+                    return (
+                        "Error: routing result contained invalid arguments format. "
+                        "Please refine your question."
+                    )
+
+                logger.info(
+                    "PanDA MCP routing selected tool '%s' with arguments %r",
+                    tool_name,
+                    arguments,
+                )
+
+                try:
+                    result = await client.call_tool(tool_name, arguments)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Error calling MCP tool %s: %s", tool_name, exc)
+                    return (
+                        f"Error while calling PanDA MCP tool '{tool_name}': {exc}. "
+                        "Please check the tool name and arguments."
+                    )
+
+                # Normalize the result to a human-readable string.
+                return self._format_mcp_result(tool_name, result)
+
+        # Run the async logic synchronously for CLI usage.
+        return asyncio.run(_inner())
 
 
-def get_clients(model: str, session_id: str or None, pandaid: str or None, taskid: str or None, cache: str) -> dict:
-    """
-    Create and return a dictionary of clients for different categories.
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
-    Args:
-        model (str): The model to use for generating answers.
-        session_id (str or None): The session ID for the context memory.
-        pandaid (str or None): The PanDA ID for the job or task, if applicable.
-        taskid (str or None): The task ID for the job or task, if applicable.
-        cache (str): The location of the cache directory.
-
-    Returns:
-        dict: A dictionary mapping client categories to their respective client classes.
-    """
-    # PanDA MCP configuration (can be overridden via environment variables)
-    panda_mcp_host = os.getenv("PANDA_MCP_HOST", "pandaserver01.sdcc.bnl.gov")
-    panda_mcp_port = int(os.getenv("PANDA_MCP_PORT", "25443"))
-    panda_mcp_transport = os.getenv("PANDA_MCP_TRANSPORT", "streamable-http")
-    panda_mcp_use_http = os.getenv("PANDA_MCP_USE_HTTP", "false").lower() == "true"
-    panda_mcp_token = os.getenv("PANDA_MCP_TOKEN")
-    panda_mcp_vo = os.getenv("PANDA_MCP_VO", "atlas")
-
-    return {
-        "document": DocumentQuery(model, session_id),
-        "queue": None,
-        "task": TaskStatus(model, taskid, cache, session_id) if session_id and taskid else None,
-        "log_analyzer": LogAnalysis(model, pandaid, cache, session_id) if pandaid else None,
-        "pilot_activity": None,
-        "panda_mcp": PanDAMCPClient(
-            host=panda_mcp_host,
-            port=panda_mcp_port,
-            transport=panda_mcp_transport,
-            use_http=panda_mcp_use_http,
-            token=panda_mcp_token,
-            vo=panda_mcp_vo,
-        ),
-    }
-
-
-def extract_job_id(text: str) -> int or None:
-    """
-    Extract a job ID from the given text using a regular expression.
-
-    Args:
-        text: The text from which to extract the job ID.
-
-    Returns:
-        int or None: The extracted job ID as an integer, or None if no job ID is found.
-    """
-    pattern = r'\b(?:job|panda[\s_]?id)\s+(\d+)\b'
-    match = re.search(pattern, text, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-
-    return None
-
-
-def extract_task_id(text: str) -> int or None:
-    """
-    Extract a task ID from the given text using a regular expression.
-
-    Args:
-        text: The text from which to extract the task ID.
-
-    Returns:
-        int or None: The extracted task ID as an integer, or None if no task ID is found.
-    """
-    pattern = r'\b(?:task[\s_]?id|task)\s+(\d+)\b'
-    match = re.search(pattern, text, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-
-    return None
-
-
-def figure_out_clients(question: str, model: str, session_id: str = None, cache: str = "cache", task_id: int = None, panda_id: int = None) -> dict:
-    """
-    Determine the appropriate client to handle the given question.
-
-    This function is used by the UI's pipe function to figure out which clients to initialize.
-
-    Args:
-        question (str): The question to be answered.
-        model (str): The model to use for generating the answer.
-        session_id (str): The session ID for the context memory.
-        cache (str): The location of the cache directory.
-        task_id (str): The task ID, if known.
-        panda_id (str): The PanDA ID for the job, if known.
-    Returns:
-        dict: A dictionary mapping client categories to their respective client classes.
-    """
-    # does the question contain a job or task id?
-    # use a regex to extract "job NNNNN" from args.question
-    pandaid = extract_job_id(question) if not panda_id else panda_id
-    taskid = extract_task_id(question) if not task_id else task_id
-    return get_clients(model, session_id, pandaid, taskid, cache)
-
-
-def get_id(input_str: str) -> int or None:
-    """
-    Extract an integer from the user-inputted string, accounting for commas, periods, and spaces.
-
-    Parameters:
-        input_str (str): The string containing the integer.
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the Selection agent.
 
     Returns:
-        Optional[int]: The extracted integer, or None if no valid integer is found.
+        Parsed arguments namespace.
     """
-
-    # Use a regular expression to match numbers with commas, spaces, or periods as separators
-    match = re.findall(r'[-+]?\d[\d,.\s]*', input_str)
-
-    # If a match is found, clean the string and convert to int
-    if match:
-        # Clean the number string by removing commas, spaces, and periods
-        cleaned_number = match[0]
-        cleaned_number = cleaned_number.replace(',', '').replace(' ', '')
-        if cleaned_number.count('.') <= 1:
-            stringlist = cleaned_number.split(".")
-            intstring = ""
-            for number in stringlist:
-                intstring += number
-            cleaned_number = intstring
-        try:
-            return int(cleaned_number)
-        except ValueError:
-            pass  # return None if conversion fails
-
-    # Return None if no match is found or conversion fails
-    return None
+    parser = argparse.ArgumentParser(description="Ask PanDA Selection Agent")
+    parser.add_argument(
+        "--question",
+        "-q",
+        required=True,
+        help="User question to route and answer.",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("ASK_PANDA_MODEL", "gemini-2.5-flash"),
+        help="LLM model identifier (default: env ASK_PANDA_MODEL or gemini-2.5-flash).",
+    )
+    parser.add_argument(
+        "--session-id",
+        "--session_id",
+        dest="session_id",
+        default=None,
+        help="Optional session ID for conversation context.",
+    )
+    parser.add_argument(
+        "--pandaid",
+        default=None,
+        help="Optional PanDA job ID for log analysis.",
+    )
+    parser.add_argument(
+        "--taskid",
+        default=None,
+        help="Optional PanDA task ID for task status queries.",
+    )
+    parser.add_argument(
+        "--cache",
+        default=os.getenv("ASK_PANDA_CACHE", "/tmp/ask_panda_cache"),
+        help="Cache path or key for Ask PanDA clients.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
+    """Main entry point for the Selection agent CLI.
+
+    This function:
+
+    1. Parses command-line arguments.
+    2. Instantiates the required Ask PanDA clients.
+    3. Creates a ``Selection`` instance.
+    4. Routes the question and prints the answer.
+
+    The presence of the PanDA MCP client is optional. If it is not configured
+    (for example, if ``PANDA_MCP_BASE_URL`` is not set), questions that would
+    otherwise route to PanDA MCP fall back to document/RAG handling.
     """
-    Parse command-line arguments, call the RAG server, and print the response.
+    args = parse_args()
+    clients = get_clients(
+        model=args.model,
+        session_id=args.session_id,
+        pandaid=args.pandaid,
+        taskid=args.taskid,
+        cache=args.cache,
+    )
 
-    This function serves as the main entry point for the command-line client.
-    It expects two arguments: the question to ask and the model to use.
-    It calls the `ask` function to get a response from the RAG server.
-    If the `ask` function returns an error (a string prefixed with "Error:"),
-    this error is printed to `sys.stderr` and the script exits with status 1.
-    Otherwise, the successful answer is printed to `sys.stdout`.
+    selection_agent = Selection(clients, args.model, args.session_id)
+    logger.info("Received query: %r", args.question)
 
-    Raises:
-        SystemExit: If the number of command-line arguments is incorrect, or
-                    if an error occurs during the RAG server request.
-    """
-    # Check server health before proceeding
-    ec = check_server_health()
-    if ec == EC_TIMEOUT:
-        logger.warning(f"Timeout while trying to connect to {ASK_PANDA_BASE_URL}.")
-        sleep(10)  # Wait for a while before retrying
-        ec = check_server_health()
-        if ec:
-            logger.error("MCP server is not healthy after retry. Exiting.")
-            sys.exit(1)
-    elif ec:
-        logger.error("MCP server is not healthy. Exiting.")
-        sys.exit(1)
-
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Process some arguments.")
-
-    parser.add_argument('--session-id', type=str, default="None",
-                        help='Session ID for the context memory')
-    parser.add_argument('--question', type=str, required=True,
-                        help='The question to ask the RAG server')
-    parser.add_argument('--model', type=str, required=True,
-                        help='The model to use for generating the answer')
-    parser.add_argument('--cache', type=str, default="cache",
-                        help='Location of cache directory (default: cache)')
-
-    args = parser.parse_args()
-
-    # does the question contain a job or task id?
-    # use a regex to extract "job NNNNN" from args.question
-    pandaid = extract_job_id(args.question)
-    if pandaid is not None:
-        logger.info(f"Extracted PanDA ID: {pandaid}")
-    else:
-        logger.info("No PanDA ID found in the question.")
-    taskid = extract_task_id(args.question)
-    if taskid is not None:
-        logger.info(f"Extracted Task ID: {taskid}")
-    else:
-        logger.info("No Task ID found in the question.")
-
-    clients = get_clients(args.model, args.session_id, pandaid, taskid, args.cache)
-    selection_client = Selection(clients, args.model)
-
-    last_question = args.question
-
-    prompt = ""
-    if args.session_id != "None":
-        # Retrieve context
-        history = memory.get_history(args.session_id)
-        for user_msg, client_msg in history:
-            prompt += f"User: {user_msg}\nAssistant: {client_msg}\n"
-    prompt += f"User: {last_question}"
-    category = selection_client.answer(prompt)
-    client = clients.get(category)
-
-    logger.info(f"Full question:\n{prompt}")
-
-    if category == "document":
-        logger.info(f"Selected client category: {category} (DocumentQuery)")
-        answer = client.ask(args.question)
-        logger.info(f"Final answer (document):\n{answer}")
-        return answer
-    elif category == "log_analyzer":
-        logger.info(f"Selected client category: {category} (LogAnalysis)")
-        if pandaid is None:
-            pandaid = get_id(prompt)
-        if pandaid is None:
-            err = "Sorry, I need a Job ID to answer questions about jobs."
-            logger.info(err)
-            return err
-        # reinitialize the client with the correct job id
-        if not client:
-            client = LogAnalysis(args.model, pandaid, args.cache, args.session_id)
-        question = client.generate_question("pilotlog.txt")
-        answer = client.ask(question)
-        logger.info(f"Final answer (log analyzer):\n{answer}")
-        return answer
-    elif category == "panda_mcp":
-        logger.info(f"Selected client category: {category} (PanDAMCPClient)")
-        # PanDAMCPClient only needs the latest user question, not the full prompt history.
-        answer = client.answer_prompt_sync(args.question)
-        logger.info(f"Final answer (panda_mcp):\n{answer}")
-        return answer
-    elif category == "task":
-        logger.info(f"Selected client category: {category} (TaskStatus)")
-        if taskid is None:
-            taskid = get_id(prompt)
-        if taskid is None:
-            err = "Sorry, I need a Task ID to answer questions about task status."
-            logger.info(err)
-            return err
-        logger.info(f"Using Task ID: {taskid}")
-        # reinitialize the client with the correct task id
-        if not client:
-            client = TaskStatus(args.model, taskid, args.cache, args.session_id)
-
-        question = client.generate_question()
-        answer = client.ask(question)
-        logger.info(f"Final answer (task):\n{answer}")
-        return answer
-    else:
-        logger.warning("Not yet implemented")
-    if client is None:
-        return "Sorry, I don’t have enough information to answer that kind of question."
-
-    return "Sorry, I found no client to answer that kind of question."
+    answer = selection_agent.ask(args.question)
+    print(answer)
 
 
 if __name__ == "__main__":
