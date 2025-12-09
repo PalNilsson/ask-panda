@@ -317,10 +317,10 @@ class CRICanalysisClient:
         try:
             conn = sqlite3.connect(CRICdb_path)
             cursor = conn.cursor()
-            cursor.execute(SQLquery)
 
             # only execute select method to prevent modification
             if SQLquery.strip().lower().startswith("select"):
+                cursor.execute(SQLquery)
                 columns = [desc[0] for desc in cursor.description]  # list of column names
                 rows = cursor.fetchall() # fetch all selected rows
 
